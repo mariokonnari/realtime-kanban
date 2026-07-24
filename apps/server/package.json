@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@realtime-kanban/shared-types": "^0.0.1",
     "ws": "^8.21.1",
     "yjs": "^13.6.31"
   },
