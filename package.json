@@ -1,9 +1,11 @@
 {
   "name": "realtime-kanban",
-  "private": "true",
+  "private": true,
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
+    "build:shared-types": "npm run build --workspace=packages/shared-types",
     "dev:web": "npm run dev --workspace=apps/web",
-    "dev:server": "npm run dev --workspace=apps/server"
+    "dev:server": "npm run dev --workspace=apps/server",
+    "build": "npm run build:shared-types && npm run build --workspaces --if-present"
   }
 }
