@@ -1,23 +1,20 @@
 {
-  "name": "server",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "@realtime-kanban/server",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "@realtime-kanban/shared-types": "^0.0.1",
-    "ws": "^8.21.1",
-    "yjs": "^13.6.31"
+    "@realtime-kanban/shared-types": "*",
+    "ws": "^8.18.0",
+    "yjs": "^13.6.0"
   },
   "devDependencies": {
-    "@types/ws": "^8.18.1",
-    "tsx": "^4.23.1",
-    "typescript": "^7.0.2"
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
   }
 }

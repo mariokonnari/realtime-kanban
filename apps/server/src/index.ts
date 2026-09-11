@@ -1,9 +1,20 @@
 import { WebSocketServer, WebSocket } from "ws";
 import * as Y from "yjs";
-import type { ClientMessage } from "@realtime-kanban/shared-types";
-import { applyMutation, applyDelete, isTombstoned, createEntity, getColumnDoc } from "./store.js";
+import type { ClientMessage, SyncResponseMessage } from "@realtime-kanban/shared-types";
+import { decodeUpdate } from "@realtime-kanban/shared-types";
+import {
+  applyMutation,
+  applyDelete,
+  isTombstoned,
+  createEntity,
+  getColumnDoc,
+  getFullState,
+  seedDemoBoard,
+} from "./store.js";
 
 const PORT = Number(process.env.PORT ?? 4001);
+seedDemoBoard();
+
 const wss = new WebSocketServer({ port: PORT });
 const clients = new Set<WebSocket>();
 
@@ -16,16 +27,24 @@ function broadcast(message: unknown, exclude?: WebSocket) {
   }
 }
 
+function send(socket: WebSocket, message: unknown) {
+  socket.send(JSON.stringify(message));
+}
+
 wss.on("connection", (socket) => {
   clients.add(socket);
 
   socket.on("message", (raw) => {
-    // NOTE: JSON.stringify/parse can't carry a raw Uint8Array (CRDT_UPDATE.update)
-    // cleanly — real implementation should send CRDT_UPDATE as a separate binary
-    // WS frame, not JSON. Flagged here rather than silently done wrong.
     const message = JSON.parse(raw.toString()) as ClientMessage;
 
     switch (message.type) {
+      case "SYNC_REQUEST": {
+        const state = getFullState();
+        const response: SyncResponseMessage = { type: "SYNC_RESPONSE", ...state };
+        send(socket, response);
+        break;
+      }
+
       case "CREATE": {
         createEntity(message.entityType, message.entityId, message.initialValues);
         broadcast(message, socket);
@@ -34,8 +53,7 @@ wss.on("connection", (socket) => {
 
       case "MUTATE": {
         if (message.entityType === "card" && isTombstoned("card", message.entityId)) {
-          // Delete wins — silently drop edits to a tombstoned card.
-          break;
+          break; // delete wins — silently drop edits to a tombstoned card
         }
         const applied = applyMutation(
           message.entityType,
@@ -56,8 +74,8 @@ wss.on("connection", (socket) => {
 
       case "CRDT_UPDATE": {
         const doc = getColumnDoc(message.columnId);
-        Y.applyUpdate(doc, new Uint8Array(message.update));
-        broadcast(message, socket);
+        Y.applyUpdate(doc, decodeUpdate(message.update));
+        broadcast(message, socket); // relay the same base64 string, no re-encoding needed
         break;
       }
     }
