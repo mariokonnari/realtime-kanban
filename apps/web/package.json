@@ -1,28 +1,25 @@
 {
-  "name": "web",
-  "version": "0.1.0",
+  "name": "@realtime-kanban/web",
+  "version": "0.0.1",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
+    "start": "next start"
   },
   "dependencies": {
-    "@realtime-kanban/shared-types": "^0.0.1",
-    "next": "16.2.11",
-    "react": "19.2.4",
-    "react-dom": "19.2.4",
-    "yjs": "^13.6.31"
+    "@realtime-kanban/shared-types": "*",
+    "next": "^16.0.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "yjs": "^13.6.0"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "eslint": "^9",
-    "eslint-config-next": "16.2.11",
-    "tailwindcss": "^4",
-    "typescript": "^5"
+    "@types/react": "^18.3.0",
+    "@types/node": "^20.12.0",
+    "typescript": "^5.4.0",
+    "tailwindcss": "^3.4.0",
+    "postcss": "^8.4.0",
+    "autoprefixer": "^10.4.0"
   }
 }
