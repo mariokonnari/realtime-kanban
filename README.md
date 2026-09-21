@@ -28,6 +28,9 @@ Persistence, auth, offline queue, and tests are the remaining gaps
 npm install
 npm run build:shared-types   # required before first run, and after
                                # any edit to packages/shared-types
+docker compose up -d          # local Postgres for apps/server
+npm run prisma:generate --workspace=apps/server
+npm run prisma:migrate --workspace=apps/server   # first run only, creates the schema
 npm run dev:server            # apps/server, ws://localhost:4001
 npm run dev:web                # apps/web, http://localhost:3000
 ```
@@ -92,11 +95,32 @@ server replies with every board/column/non-tombstoned-card plus each
 column's full CRDT state, so a client joining mid-session sees
 current state immediately instead of waiting for the next edit.
 
+## Persistence
+
+`apps/server/src/store.ts` is backed by Postgres via Prisma
+(`apps/server/prisma/schema.prisma`). The in-memory `Map`s that the
+LWW/CRDT logic reads and writes are still there — they're hydrated
+from Postgres on startup (`initStore()`) and every mutation is
+written through to the DB after the in-memory check-and-set, so the
+conflict-resolution code itself never touches Prisma directly.
+
+- `field_clocks` persists the same `{ lamport, clientId }` each field
+  last applied, not just the entity data — without it a restart would
+  forget which edits already won and let an old edit resurrect itself.
+- `column_docs` persists each column's full Yjs state
+  (`Y.encodeStateAsUpdate`), so card ordering survives a restart too.
+- DB writes are queued (`store.ts`'s `enqueue`) so they land in the
+  same order as the in-memory mutations that triggered them — Prisma
+  calls are async, so without this a slower write for an
+  already-superseded clock could finish after a newer one and leave
+  the DB holding the stale value.
+- `seedDemoBoard()` only seeds if `boards` is empty in Postgres.
+
+Local dev Postgres: `docker compose up -d`, then from `apps/server`:
+`npm run prisma:generate && npm run prisma:migrate`.
+
 ## Known gaps
 
-- **No persistence** — `apps/server/src/store.ts` is in-memory;
-  restarting the server loses all data. Swappable for Postgres/Prisma
-  without touching the LWW/CRDT logic itself.
 - **No auth** — anyone who connects can edit anything.
 - **No offline queue / reconnect sync** — the client's WebSocket
   reconnects on drop (naive fixed-delay, no backoff), but any edits
