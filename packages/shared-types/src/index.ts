@@ -36,6 +36,17 @@ export interface Card {
 
 export type EntityType = "board" | "column" | "card";
 
+// ---- Presence (ephemeral, not persisted — see apps/server/src/index.ts) ----
+
+// No real auth: each tab picks a random name + color for itself on
+// connect, just enough to tell two open tabs apart in a demo.
+export interface Presence {
+  clientId: string;
+  name: string;
+  color: string;
+  cardId: string | null; // the card this client is actively editing, or null
+}
+
 // ---- Wire messages ----
 
 export interface MutateMessage {
@@ -68,6 +79,13 @@ export interface DeleteMessage {
   clock: LamportClock;
 }
 
+// Broadcast whenever a client starts or stops editing a card
+// (cardId: null means "stopped"). No clock — last message for a given
+// clientId simply wins, which is fine for a display-only hint.
+export interface PresenceMessage extends Presence {
+  type: "PRESENCE";
+}
+
 // Sent by a client immediately on connecting — it has no state yet
 // and needs the server to hand it everything that currently exists.
 export interface SyncRequestMessage {
@@ -82,6 +100,7 @@ export interface SyncResponseMessage {
   columns: Column[];
   cards: Card[]; // tombstoned cards are excluded, not sent
   columnOrders: Record<string, string>; // columnId -> base64 full Y.Doc state
+  presence: Presence[]; // who else is currently editing what, for late joiners
 }
 
 export type ClientMessage =
@@ -89,6 +108,7 @@ export type ClientMessage =
   | CrdtUpdateMessage
   | CreateMessage
   | DeleteMessage
+  | PresenceMessage
   | SyncRequestMessage;
 
 export type ServerMessage =
@@ -96,4 +116,5 @@ export type ServerMessage =
   | CrdtUpdateMessage
   | CreateMessage
   | DeleteMessage
+  | PresenceMessage
   | SyncResponseMessage;

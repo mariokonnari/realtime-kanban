@@ -20,6 +20,24 @@ export function getClientId() {
   return clientId;
 }
 
+// No real auth: just enough that two open tabs are visually
+// distinguishable in a demo. Picked once per tab, same lifetime as
+// clientId above.
+const PRESENCE_NAMES = [
+  "Otter", "Falcon", "Lynx", "Panda", "Heron", "Fox", "Wren", "Orca",
+  "Ibis", "Newt", "Puffin", "Badger", "Mantis", "Gecko", "Raven", "Stoat",
+];
+const PRESENCE_COLORS = [
+  "#ef4444", "#f97316", "#eab308", "#22c55e",
+  "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899",
+];
+
+function pick<T>(list: T[]): T {
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+export const presenceIdentity = { name: pick(PRESENCE_NAMES), color: pick(PRESENCE_COLORS) };
+
 type Listener = (message: ServerMessage) => void;
 
 class WsClient {

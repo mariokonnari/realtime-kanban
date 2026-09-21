@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
 import * as Y from "yjs";
-import type { ClientMessage, SyncResponseMessage } from "@realtime-kanban/shared-types";
+import type { ClientMessage, Presence, SyncResponseMessage } from "@realtime-kanban/shared-types";
 import { decodeUpdate } from "@realtime-kanban/shared-types";
 import {
   applyMutation,
@@ -20,6 +20,11 @@ await seedDemoBoard();
 
 const wss = new WebSocketServer({ port: PORT });
 const clients = new Set<WebSocket>();
+
+// Who's editing what, right now — ephemeral, not persisted (see
+// README.md "Persistence"). Keyed by socket so a disconnect can clean up
+// without the client getting a chance to say "I stopped editing" first.
+const presenceBySocket = new Map<WebSocket, Presence>();
 
 function broadcast(message: unknown, exclude?: WebSocket) {
   const payload = JSON.stringify(message);
@@ -43,7 +48,11 @@ wss.on("connection", (socket) => {
     switch (message.type) {
       case "SYNC_REQUEST": {
         const state = getFullState();
-        const response: SyncResponseMessage = { type: "SYNC_RESPONSE", ...state };
+        const response: SyncResponseMessage = {
+          type: "SYNC_RESPONSE",
+          ...state,
+          presence: [...presenceBySocket.values()],
+        };
         send(socket, response);
         break;
       }
@@ -82,10 +91,30 @@ wss.on("connection", (socket) => {
         broadcast(message, socket); // relay the same base64 string, no re-encoding needed
         break;
       }
+
+      case "PRESENCE": {
+        presenceBySocket.set(socket, {
+          clientId: message.clientId,
+          name: message.name,
+          color: message.color,
+          cardId: message.cardId,
+        });
+        broadcast(message, socket);
+        break;
+      }
     }
   });
 
-  socket.on("close", () => clients.delete(socket));
+  socket.on("close", () => {
+    clients.delete(socket);
+    const presence = presenceBySocket.get(socket);
+    presenceBySocket.delete(socket);
+    // If this client was mid-edit when it disconnected, tell everyone else
+    // to drop the badge — otherwise it'd be stuck showing forever.
+    if (presence?.cardId != null) {
+      broadcast({ type: "PRESENCE", ...presence, cardId: null } satisfies ClientMessage);
+    }
+  });
 });
 
 console.log(`Kanban WS server listening on ws://localhost:${PORT}`);

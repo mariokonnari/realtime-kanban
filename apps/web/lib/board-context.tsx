@@ -1,10 +1,10 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useReducer, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import * as Y from "yjs";
-import type { Board, Column, Card, ServerMessage } from "@realtime-kanban/shared-types";
+import type { Board, Column, Card, Presence, ServerMessage } from "@realtime-kanban/shared-types";
 import { encodeUpdate, decodeUpdate } from "@realtime-kanban/shared-types";
-import { wsClient, nextClock } from "./ws-client";
+import { wsClient, nextClock, getClientId, presenceIdentity } from "./ws-client";
 
 export interface BoardState {
   boards: Record<string, Board>;
@@ -49,12 +49,19 @@ export function reducer(state: BoardState, action: Action): BoardState {
   }
 }
 
+export interface Editor {
+  name: string;
+  color: string;
+}
+
 interface BoardApi extends BoardState {
   columnOrder: Record<string, string[]>;
+  editorsByCard: Record<string, Editor[]>;
   updateCardField: (cardId: string, field: "title" | "description", value: string) => void;
   createCard: (columnId: string, title: string) => void;
   deleteCard: (cardId: string) => void;
   moveCard: (cardId: string, fromColumnId: string, toColumnId: string, toIndex: number) => void;
+  setEditingCard: (cardId: string | null) => void;
 }
 
 const BoardContext = createContext<BoardApi | null>(null);
@@ -68,6 +75,9 @@ export function useBoard() {
 export function BoardProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(reducer, { boards: {}, columns: {}, cards: {} });
   const [columnOrder, setColumnOrder] = useState<Record<string, string[]>>({});
+  // Who else is editing what, keyed by their clientId — never includes
+  // our own tab, since the server excludes the sender from broadcasts.
+  const [presenceByClient, setPresenceByClient] = useState<Record<string, Presence>>({});
   const docsRef = useRef<Map<string, Y.Doc>>(new Map());
 
   // Gets (or lazily creates) the Y.Doc for a column and wires its
@@ -95,6 +105,19 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
           Object.entries(message.columnOrders).forEach(([columnId, base64]) => {
             Y.applyUpdate(getDoc(columnId), decodeUpdate(base64));
           });
+          setPresenceByClient(
+            Object.fromEntries(
+              message.presence.filter((p) => p.clientId !== getClientId()).map((p) => [p.clientId, p]),
+            ),
+          );
+          break;
+        }
+        case "PRESENCE": {
+          if (message.clientId === getClientId()) break; // never track our own tab
+          setPresenceByClient((prev) => ({
+            ...prev,
+            [message.clientId]: { clientId: message.clientId, name: message.name, color: message.color, cardId: message.cardId },
+          }));
           break;
         }
         case "CREATE": {
@@ -193,6 +216,34 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
     [getDoc],
   );
 
-  const value: BoardApi = { ...state, columnOrder, updateCardField, createCard, deleteCard, moveCard };
+  const setEditingCard = useCallback((cardId: string | null) => {
+    wsClient.send({
+      type: "PRESENCE",
+      clientId: getClientId(),
+      name: presenceIdentity.name,
+      color: presenceIdentity.color,
+      cardId,
+    });
+  }, []);
+
+  const editorsByCard = useMemo(() => {
+    const byCard: Record<string, Editor[]> = {};
+    for (const presence of Object.values(presenceByClient)) {
+      if (!presence.cardId) continue;
+      (byCard[presence.cardId] ??= []).push({ name: presence.name, color: presence.color });
+    }
+    return byCard;
+  }, [presenceByClient]);
+
+  const value: BoardApi = {
+    ...state,
+    columnOrder,
+    editorsByCard,
+    updateCardField,
+    createCard,
+    deleteCard,
+    moveCard,
+    setEditingCard,
+  };
   return <BoardContext.Provider value={value}>{children}</BoardContext.Provider>;
 }
