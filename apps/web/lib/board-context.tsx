@@ -6,7 +6,7 @@ import type { Board, Column, Card, ServerMessage } from "@realtime-kanban/shared
 import { encodeUpdate, decodeUpdate } from "@realtime-kanban/shared-types";
 import { wsClient, nextClock } from "./ws-client";
 
-interface BoardState {
+export interface BoardState {
   boards: Record<string, Board>;
   columns: Record<string, Column>;
   cards: Record<string, Card>;
@@ -14,13 +14,13 @@ interface BoardState {
 
 type Table = "boards" | "columns" | "cards";
 
-type Action =
+export type Action =
   | { type: "SYNC"; boards: Board[]; columns: Column[]; cards: Card[] }
   | { type: "UPSERT"; table: Table; id: string; entity: Board | Column | Card }
   | { type: "PATCH"; table: Table; id: string; field: string; value: unknown }
   | { type: "REMOVE"; table: Table; id: string };
 
-function reducer(state: BoardState, action: Action): BoardState {
+export function reducer(state: BoardState, action: Action): BoardState {
   switch (action.type) {
     case "SYNC":
       return {
