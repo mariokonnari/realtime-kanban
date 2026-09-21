@@ -8,12 +8,15 @@ import {
   isTombstoned,
   createEntity,
   getColumnDoc,
+  persistColumnDoc,
   getFullState,
+  initStore,
   seedDemoBoard,
 } from "./store.js";
 
 const PORT = Number(process.env.PORT ?? 4001);
-seedDemoBoard();
+await initStore();
+await seedDemoBoard();
 
 const wss = new WebSocketServer({ port: PORT });
 const clients = new Set<WebSocket>();
@@ -75,6 +78,7 @@ wss.on("connection", (socket) => {
       case "CRDT_UPDATE": {
         const doc = getColumnDoc(message.columnId);
         Y.applyUpdate(doc, decodeUpdate(message.update));
+        persistColumnDoc(message.columnId);
         broadcast(message, socket); // relay the same base64 string, no re-encoding needed
         break;
       }
