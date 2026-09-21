@@ -1,0 +1,68 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Board {
+  id        String   @id
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  columns Column[]
+
+  @@map("boards")
+}
+
+model Column {
+  id      String @id
+  boardId String @map("board_id")
+  title   String
+  order   Int
+
+  board Board      @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  cards Card[]
+  doc   ColumnDoc?
+
+  @@map("columns")
+}
+
+model Card {
+  id          String    @id
+  columnId    String    @map("column_id")
+  title       String
+  description String
+  position    Float
+  createdAt   DateTime  @default(now()) @map("created_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  column Column @relation(fields: [columnId], references: [id], onDelete: Cascade)
+
+  @@map("cards")
+}
+
+// One row per (entityId, field) — the Lamport clock that last won that
+// field, so a restart can't let an older edit re-apply over a newer one.
+model FieldClock {
+  entityId String @map("entity_id")
+  field    String
+  lamport  Int
+  clientId String @map("client_id")
+
+  @@id([entityId, field])
+  @@map("field_clocks")
+}
+
+// Full Yjs doc state for a column's card ordering (Y.encodeStateAsUpdate),
+// so drag/reorder history doesn't have to replay from scratch on restart.
+model ColumnDoc {
+  columnId String @id @map("column_id")
+  state    Bytes
+
+  column Column @relation(fields: [columnId], references: [id], onDelete: Cascade)
+
+  @@map("column_docs")
+}
