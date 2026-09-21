@@ -6,9 +6,9 @@ single-value fields, and CRDTs (Yjs) for concurrent list ordering.
 
 **Status: the core real-time loop is built and verified — board UI,
 WebSocket client, LWW mutations, CRDT card ordering, tombstoned
-deletes, and sync-on-connect for late joiners all work end to end.**
-Persistence, auth, offline queue, and tests are the remaining gaps
-(see below).
+deletes, sync-on-connect for late joiners, Postgres persistence, and
+lightweight per-tab presence all work end to end.** Auth, an offline
+queue, and column management UI are the remaining gaps (see below).
 
 ## Architecture
 
@@ -22,7 +22,7 @@ Persistence, auth, offline queue, and tests are the remaining gaps
   (see "Why shared-types is compiled" below — this wasn't the
   original design, it's a fix for a real bug).
 
-## Local dev workflow
+## Running this locally
 
 ```bash
 npm install
@@ -38,8 +38,11 @@ npm run dev:web                # apps/web, http://localhost:3000
 Open `http://localhost:3000` in two browser tabs side by side. Add a
 card in one tab — it appears in the other. Drag a card between
 columns or reorder it within a column — both tabs converge to the
-same order. Edit a card's title concurrently in both tabs — one edit
-wins deterministically (LWW), not just "whichever saved last."
+same order, with a drop-zone highlight showing where the card will
+land. Edit a card's title concurrently in both tabs — one edit wins
+deterministically (LWW), not just "whichever saved last." Click into
+a card to edit it in one tab — the other tab shows a small colored
+name badge on that card for as long as you're editing.
 
 **If you're actively editing `packages/shared-types`**, run
 `npm run dev --workspace=packages/shared-types` in a separate
@@ -116,8 +119,7 @@ conflict-resolution code itself never touches Prisma directly.
   the DB holding the stale value.
 - `seedDemoBoard()` only seeds if `boards` is empty in Postgres.
 
-Local dev Postgres: `docker compose up -d`, then from `apps/server`:
-`npm run prisma:generate && npm run prisma:migrate`.
+See "Running this locally" above for the local Postgres setup.
 
 ## Known gaps
 
@@ -125,9 +127,18 @@ Local dev Postgres: `docker compose up -d`, then from `apps/server`:
 - **No offline queue / reconnect sync** — the client's WebSocket
   reconnects on drop (naive fixed-delay, no backoff), but any edits
   made while disconnected are lost, not queued.
-- **No tests** — Vitest + RTL were part of the original plan and
-  haven't been added yet.
+- **Test coverage is unit-level, not end-to-end.**
+  `apps/server/src/*.test.ts` covers the LWW tie-breaking rules, the
+  CRDT-vs-naive-LWW ordering guarantee side by side, and tombstone
+  behavior; `apps/web/**/*.test.ts` covers the board reducer and
+  `CardItem`. Nothing drives the actual WebSocket server end-to-end,
+  and `Board.tsx`/`Column.tsx` and the drag-and-drop interaction
+  aren't covered.
 - **No column management UI** — columns are fixed at three, seeded
   server-side.
+- **Presence is best-effort, not persisted** — editing badges are
+  relayed live between connected clients and included in
+  `SYNC_RESPONSE` for late joiners, but there's no history once a
+  client disconnects mid-edit beyond clearing its badge.
 - **Base64 CRDT transport** is a real tradeoff, not a bug, but binary
   WS frames would be more efficient at larger scale.
