@@ -18,7 +18,25 @@ const PORT = Number(process.env.PORT ?? 4001);
 await initStore();
 await seedDemoBoard();
 
-const wss = new WebSocketServer({ port: PORT });
+// WebSocket handshakes aren't subject to browser CORS/same-origin checks
+// the way fetch()/XHR are — with no verifyClient at all, this server
+// already accepts a connection from any origin (that's how it's worked
+// against localhost all along). ALLOWED_ORIGINS is opt-in hardening for
+// production: unset, behavior is unchanged; set (comma-separated) in
+// deployment, only matching Origin headers are accepted. See README
+// "Deployment".
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const wss = new WebSocketServer({
+  port: PORT,
+  verifyClient:
+    allowedOrigins.length > 0
+      ? (info: { origin: string }) => allowedOrigins.includes(info.origin)
+      : undefined,
+});
 const clients = new Set<WebSocket>();
 
 // Who's editing what, right now — ephemeral, not persisted (see
