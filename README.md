@@ -121,6 +121,124 @@ conflict-resolution code itself never touches Prisma directly.
 
 See "Running this locally" above for the local Postgres setup.
 
+## Deployment
+
+**Live demo:** _not yet deployed — see steps below_
+
+Three separate services, matching "Architecture" above: `apps/web` →
+Vercel, `apps/server` → Render, Postgres → Supabase (chosen over
+Render's own free Postgres, which is deleted after 30 days — Supabase's
+free tier only pauses on inactivity and keeps the data).
+
+### 1. Supabase (database)
+
+Create a project, then **Project Settings → Database → Connection
+string** and copy the **Session pooler** string, not "Direct
+connection." Supabase's direct-connection host is IPv6-only on the free
+tier, and Render (like most PaaS platforms) only has IPv4 egress, so the
+direct string will fail to connect from Render even though it works
+from a home network with IPv6. The session pooler is IPv4-reachable and
+— unlike the transaction pooler on port 6543 — behaves enough like a
+normal Postgres connection that Prisma Client and `prisma migrate
+deploy` both work against it with no extra flags (`pgbouncer=true`
+etc.). This string becomes `DATABASE_URL` in step 2.
+
+### 2. Render (apps/server)
+
+Create a **Web Service** from this repo. Leave **Root Directory**
+unset (the repo root) — `apps/server` depends on `packages/shared-types`,
+and running `npm install` from the repo root is what makes npm
+workspaces resolve that and hoist `node_modules` correctly; setting
+Root Directory to `apps/server` would `cd` into it before `npm install`
+ever runs and break that resolution.
+
+- **Build Command:**
+  ```
+  npm install && npm run build:shared-types && npx prisma generate --schema=apps/server/prisma/schema.prisma && npm run build --workspace=apps/server
+  ```
+- **Pre-Deploy Command** (runs after build, before the new instance
+  takes traffic; if your plan's UI doesn't have this field, append it
+  to the Build Command instead):
+  ```
+  npx prisma migrate deploy --schema=apps/server/prisma/schema.prisma
+  ```
+- **Start Command:**
+  ```
+  node apps/server/dist/index.js
+  ```
+- **Environment variables:**
+  - `DATABASE_URL` — the Supabase session pooler string from step 1.
+  - `ALLOWED_ORIGINS` (optional, recommended) — your Vercel domain,
+    e.g. `https://your-app.vercel.app`. See "WebSocket origin checks"
+    below.
+  - `PORT` — Render sets this automatically; `index.ts` already reads
+    `process.env.PORT`, no action needed.
+
+Render's free tier spins the service down after 15 minutes of
+inactivity. Data isn't at risk (Postgres lives on Supabase, not on this
+service), but the first connection after idle time takes 30–60s to wake
+it back up — the client's fixed-delay reconnect in `ws-client.ts` just
+keeps retrying until it succeeds, so this shows up as a slow first
+connect, not an error.
+
+Once deployed, note the `https://<name>.onrender.com` URL — Render
+terminates TLS for you, so `wss://<name>.onrender.com` (swap the
+scheme) is what becomes `NEXT_PUBLIC_WS_URL` in step 3. No code change
+is needed for `wss://` to work.
+
+### 3. Vercel (apps/web)
+
+Import the repo, then in **Project Settings**:
+
+- **Root Directory:** `apps/web`, with **"Include source files outside
+  of the Root Directory in the Build Step"** turned on — needed so the
+  build can still see `../../packages/shared-types` and the root
+  lockfile for npm workspaces to resolve. (If that setting doesn't
+  behave as expected, the fallback is Root Directory = repo root with
+  Output Directory = `apps/web/.next`.)
+- **Build Command** (override the default — see below):
+  ```
+  npm --prefix ../.. run build:shared-types && npm run build
+  ```
+- **Environment variables:**
+  - `NEXT_PUBLIC_WS_URL` = `wss://<your-render-service>.onrender.com`
+
+  Set this **before** the first build, or redeploy after adding it.
+  Next.js inlines `NEXT_PUBLIC_*` variables into the JS bundle at build
+  time — it does not read them at runtime — so changing the value later
+  requires a new build, not just a restart.
+
+### Does the build need shared-types built first?
+
+Yes. `packages/shared-types/package.json` points `main` at
+`dist/index.js`, not source (see "Why shared-types is compiled"
+above). If `apps/web`'s build runs plain `next build` with no `dist/`
+present, the import `@realtime-kanban/shared-types` fails to resolve
+and the build breaks. The override above runs the same
+`build:shared-types` step the root `npm run build` script already
+does, just from `apps/web`'s working directory (Vercel always builds
+from Root Directory).
+
+### WebSocket origin checks (CORS)
+
+No server changes were needed for the deployed web app to *connect* —
+a WebSocket handshake isn't a `fetch()`/XHR request, so it isn't
+subject to the browser's CORS/same-origin checks. `apps/server` will
+accept a connection from your Vercel domain with zero configuration,
+exactly like it already does from `localhost`.
+
+The flip side: with nothing configured, it also accepts a connection
+from anywhere else — the WS endpoint has a public, guessable URL now,
+so anyone who has it can open a raw WebSocket and read/write board
+data, same as the already-documented "No auth" gap, just reachable
+from the internet instead of only your machine. `index.ts` supports an
+optional `ALLOWED_ORIGINS` env var (comma-separated) that restricts
+accepted connections via `verifyClient`; left unset, it's a no-op —
+local dev and the zero-config deploy behave exactly as before. Set it
+to your Vercel production domain once you have it. (Vercel preview
+deployments get a new URL each time, so this only cleanly covers the
+production domain unless you keep `ALLOWED_ORIGINS` updated.)
+
 ## Known gaps
 
 - **No auth** — anyone who connects can edit anything.
