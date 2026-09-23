@@ -57,6 +57,10 @@ export interface Editor {
 interface BoardApi extends BoardState {
   columnOrder: Record<string, string[]>;
   editorsByCard: Record<string, Editor[]>;
+  // Other clients currently connected (never includes this tab) — already
+  // tracked for the per-card editing badges, just exposed here as-is for
+  // the dashboard's live-collaborator count. Not a sync-logic change.
+  collaborators: Presence[];
   updateCardField: (cardId: string, field: "title" | "description", value: string) => void;
   createCard: (columnId: string, title: string) => void;
   deleteCard: (cardId: string) => void;
@@ -235,10 +239,13 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
     return byCard;
   }, [presenceByClient]);
 
+  const collaborators = useMemo(() => Object.values(presenceByClient), [presenceByClient]);
+
   const value: BoardApi = {
     ...state,
     columnOrder,
     editorsByCard,
+    collaborators,
     updateCardField,
     createCard,
     deleteCard,
