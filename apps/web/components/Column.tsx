@@ -3,14 +3,16 @@
 import { useState, type DragEvent } from "react";
 import { useBoard } from "@/lib/board-context";
 import type { Column } from "@realtime-kanban/shared-types";
+import { ACCENT_BG, ACCENT_BG_SOFT, ACCENT_BORDER_SOFT, type ColumnAccent } from "@/lib/palette";
 import { CardItem } from "./CardItem";
 
-export function ColumnView({ column }: { column: Column }) {
+export function ColumnView({ column, accent }: { column: Column; accent: ColumnAccent }) {
   const { cards, columnOrder, createCard, moveCard } = useBoard();
   const [draftTitle, setDraftTitle] = useState("");
   const [isDragOver, setIsDragOver] = useState(false);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
   const cardIds = columnOrder[column.id] ?? [];
+  const cardCount = cardIds.filter((id) => cards[id]).length;
 
   function handleDragOverSlot(e: DragEvent, index: number) {
     e.preventDefault();
@@ -43,19 +45,23 @@ export function ColumnView({ column }: { column: Column }) {
 
   return (
     <div
-      className={`w-72 shrink-0 rounded-lg p-3 border-2 transition-colors ${
-        isDragOver ? "bg-blue-50 border-blue-300" : "bg-gray-50 border-transparent"
+      className={`w-72 shrink-0 snap-start rounded-xl p-3 border-2 transition-colors bg-white/60 ${
+        isDragOver ? `${ACCENT_BORDER_SOFT[accent]} ${ACCENT_BG_SOFT[accent]}` : "border-transparent"
       }`}
       onDragOver={(e) => handleDragOverSlot(e, cardIds.length)}
       onDragLeave={handleDragLeave}
       onDrop={(e) => handleDrop(e, cardIds.length)}
     >
-      <h2 className="font-medium text-sm text-gray-600 mb-3">{column.title}</h2>
+      <div className="flex items-baseline justify-between mb-2">
+        <h2 className="font-display font-semibold text-sm text-ink">{column.title}</h2>
+        <span className="text-xs text-ink/40 tabular-nums">{cardCount}</span>
+      </div>
+      <div className={`h-1 rounded-full mb-3 ${ACCENT_BG[accent]}`} />
       <div className="space-y-2 min-h-4">
         {cardIds.length === 0 && (
           <div
-            className={`rounded border border-dashed text-center text-xs py-4 transition-colors ${
-              isDragOver ? "border-blue-300 text-blue-400 bg-blue-50" : "border-gray-200 text-gray-400"
+            className={`rounded-lg border border-dashed text-center text-xs py-4 transition-colors ${
+              isDragOver ? `${ACCENT_BORDER_SOFT[accent]} ${ACCENT_BG_SOFT[accent]} text-ink/50` : "border-ink/15 text-ink/40"
             }`}
           >
             No cards yet
@@ -66,14 +72,16 @@ export function ColumnView({ column }: { column: Column }) {
           if (!card) return null;
           return (
             <div key={cardId}>
-              {dropIndex === index && <div className="h-0.5 rounded bg-blue-400 mb-2" />}
+              {dropIndex === index && <div className={`h-1 rounded-full mb-2 ${ACCENT_BG[accent]}`} />}
               <div onDragOver={(e) => handleDragOverSlot(e, index)} onDrop={(e) => handleDrop(e, index)}>
-                <CardItem card={card} columnId={column.id} />
+                <CardItem card={card} columnId={column.id} accent={accent} />
               </div>
             </div>
           );
         })}
-        {dropIndex === cardIds.length && cardIds.length > 0 && <div className="h-0.5 rounded bg-blue-400" />}
+        {dropIndex === cardIds.length && cardIds.length > 0 && (
+          <div className={`h-1 rounded-full ${ACCENT_BG[accent]}`} />
+        )}
       </div>
       <form
         className="mt-3"
@@ -85,7 +93,7 @@ export function ColumnView({ column }: { column: Column }) {
         }}
       >
         <input
-          className="w-full text-sm px-2 py-1.5 rounded border border-gray-200 bg-white placeholder:text-gray-400"
+          className="w-full text-sm px-2.5 py-1.5 rounded-lg border border-ink/10 bg-white placeholder:text-ink/35 text-ink"
           placeholder="+ Add a card"
           value={draftTitle}
           onChange={(e) => setDraftTitle(e.target.value)}
