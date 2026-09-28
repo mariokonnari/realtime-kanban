@@ -13,8 +13,17 @@ import {
   initStore,
   seedDemoBoard,
 } from "./store.js";
+import { assertServerDatabaseHost } from "./db-guard.js";
 
 const PORT = Number(process.env.PORT ?? 4001);
+
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  console.error("Refusing to start: DATABASE_URL is not set.");
+  process.exit(1);
+}
+assertServerDatabaseHost(databaseUrl, process.env);
+
 await initStore();
 await seedDemoBoard();
 
