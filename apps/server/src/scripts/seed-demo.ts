@@ -119,11 +119,21 @@ export async function seedCards(
 }
 
 async function main() {
-  const databaseUrl = process.env.DATABASE_URL ?? "";
-  const hostname = databaseUrl ? getDatabaseHostname(databaseUrl) : "";
+  // Loaded explicitly via --env-file-if-exists=.env in package.json's
+  // seed:demo script — see index.ts for why that flag and not --env-file.
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    console.error(
+      "Refusing to run: DATABASE_URL is not set.\n" +
+        "Copy apps/server/.env.example to apps/server/.env and fill in a local Postgres connection string, then try again.",
+    );
+    process.exit(1);
+  }
+
+  const hostname = getDatabaseHostname(databaseUrl);
   if (!isLocalHostname(hostname)) {
     console.error(
-      `Refusing to run: DATABASE_URL points at "${hostname || "(unset)"}", not localhost.\n` +
+      `Refusing to run: DATABASE_URL points at "${hostname}", not localhost.\n` +
         "This script seeds demo data and only ever runs against a local database " +
         "(e.g. the docker-compose Postgres from the README) — never a remote one.",
     );
