@@ -5,7 +5,7 @@ import { accentForIndex, ACCENT_BG } from "@/lib/palette";
 
 function DashboardSkeleton() {
   return (
-    <div className="p-4 sm:p-8" role="status" aria-live="polite">
+    <div className="max-w-6xl mx-auto px-4 sm:px-8 py-4 sm:py-8" role="status" aria-live="polite">
       <span className="sr-only">Loading dashboard…</span>
       <div className="h-6 w-48 bg-ink/10 rounded animate-pulse motion-reduce:animate-none mb-6" />
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -34,8 +34,11 @@ export function Dashboard() {
     return <DashboardSkeleton />;
   }
 
-  const sortedColumns = Object.values(columns).sort((a, b) => a.order - b.order);
-  const activeCards = Object.values(cards);
+  const sortedColumns = Object.values(columns)
+    .filter((c) => c.boardId === board.id)
+    .sort((a, b) => a.order - b.order);
+  const boardColumnIds = new Set(sortedColumns.map((c) => c.id));
+  const activeCards = Object.values(cards).filter((card) => boardColumnIds.has(card.columnId));
   const totalActive = activeCards.length;
   const liveCount = collaborators.length + 1; // +1 for this tab
   const countsByColumn = sortedColumns.map((column) => ({
@@ -45,7 +48,7 @@ export function Dashboard() {
   const maxColumnCount = Math.max(1, ...countsByColumn.map((c) => c.count));
 
   return (
-    <div className="p-4 sm:p-8 max-w-6xl mx-auto">
+    <div className="max-w-6xl mx-auto px-4 sm:px-8 py-4 sm:py-8">
       <h1 className="font-display text-lg sm:text-xl font-semibold text-ink mb-6">{board.name} — Dashboard</h1>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
