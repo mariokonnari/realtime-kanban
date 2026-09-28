@@ -31,6 +31,7 @@ export interface Card {
   description: string; // LWW
   position: number; // legacy naive field, superseded by each column's Y.Array
   createdAt: string;
+  updatedAt: string; // bumped by the server on create and on every applied LWW mutation — never on a rejected one
   deletedAt: string | null; // tombstone — never hard-delete
 }
 
@@ -56,6 +57,10 @@ export interface MutateMessage {
   field: string;
   value: unknown;
   clock: LamportClock;
+  // Only ever set (by the server, on broadcast) when entityType is "card" —
+  // carries the card's new updatedAt so other connected clients can update
+  // their local copy live, without waiting for a reconnect/resync.
+  updatedAt?: string;
 }
 
 export interface CrdtUpdateMessage {
@@ -84,6 +89,15 @@ export interface DeleteMessage {
 // clientId simply wins, which is fine for a display-only hint.
 export interface PresenceMessage extends Presence {
   type: "PRESENCE";
+}
+
+// Broadcast by the server when a socket disconnects — tells other clients
+// to drop this clientId from their presence map entirely (not just clear
+// its cardId), so a client that leaves is never left behind as a stale
+// "collaborator" — including one that connected but never edited anything.
+export interface PresenceLeaveMessage {
+  type: "PRESENCE_LEAVE";
+  clientId: string;
 }
 
 // Sent by a client immediately on connecting — it has no state yet
@@ -117,4 +131,5 @@ export type ServerMessage =
   | CreateMessage
   | DeleteMessage
   | PresenceMessage
+  | PresenceLeaveMessage
   | SyncResponseMessage;

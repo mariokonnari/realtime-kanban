@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
 import * as Y from "yjs";
-import type { ClientMessage, Presence, SyncResponseMessage } from "@realtime-kanban/shared-types";
+import type { ClientMessage, Presence, ServerMessage, SyncResponseMessage } from "@realtime-kanban/shared-types";
 import { decodeUpdate } from "@realtime-kanban/shared-types";
 import {
   applyMutation,
@@ -12,14 +12,28 @@ import {
   getFullState,
   initStore,
   seedDemoBoard,
+  cards,
 } from "./store.js";
 import { assertServerDatabaseHost } from "./db-guard.js";
 
 const PORT = Number(process.env.PORT ?? 4001);
 
+// DATABASE_URL is expected to already be in process.env by this point.
+// The "dev" script loads apps/server/.env explicitly via Node's
+// --env-file-if-exists flag (see package.json) — deliberately not
+// --env-file, which hard-crashes with a Node-internal error before any of
+// this code runs if the file is missing; --env-file-if-exists degrades to
+// "just don't set it," letting this check below produce a clear message
+// instead. The "start" script (production) has no such flag: Render
+// supplies env vars from its own dashboard, and there is no .env file
+// there — this check has to work with nothing but process.env either way.
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
-  console.error("Refusing to start: DATABASE_URL is not set.");
+  console.error(
+    "Refusing to start: DATABASE_URL is not set.\n" +
+      "Local dev: copy apps/server/.env.example to apps/server/.env and fill in a local Postgres connection string.\n" +
+      "Production: set DATABASE_URL as an environment variable (e.g. Render's dashboard) — no .env file is used there.",
+  );
   process.exit(1);
 }
 assertServerDatabaseHost(databaseUrl, process.env);
@@ -86,7 +100,15 @@ wss.on("connection", (socket) => {
 
       case "CREATE": {
         createEntity(message.entityType, message.entityId, message.initialValues);
-        broadcast(message, socket);
+        // createEntity() overrides updatedAt with the server's own clock for
+        // cards (see store.ts) — relay that authoritative value to other
+        // clients too, not the client-sent one the raw message still
+        // carries, so what they see matches what was actually persisted.
+        const updatedAt = message.entityType === "card" ? cards.get(message.entityId)?.updatedAt : undefined;
+        broadcast(
+          updatedAt ? { ...message, initialValues: { ...message.initialValues, updatedAt } } : message,
+          socket,
+        );
         break;
       }
 
@@ -101,7 +123,13 @@ wss.on("connection", (socket) => {
           message.value,
           message.clock,
         );
-        if (applied) broadcast(message, socket);
+        if (applied) {
+          // applyMutation already bumped the in-memory card's updatedAt
+          // synchronously — attach it so other clients can update their
+          // local copy live instead of waiting for a reconnect/resync.
+          const updatedAt = message.entityType === "card" ? cards.get(message.entityId)?.updatedAt : undefined;
+          broadcast(updatedAt ? { ...message, updatedAt } : message, socket);
+        }
         break;
       }
 
@@ -136,10 +164,14 @@ wss.on("connection", (socket) => {
     clients.delete(socket);
     const presence = presenceBySocket.get(socket);
     presenceBySocket.delete(socket);
-    // If this client was mid-edit when it disconnected, tell everyone else
-    // to drop the badge — otherwise it'd be stuck showing forever.
-    if (presence?.cardId != null) {
-      broadcast({ type: "PRESENCE", ...presence, cardId: null } satisfies ClientMessage);
+    // Tell everyone else this client is gone entirely — not just "stopped
+    // editing" (the old cardId:null broadcast this replaces only fired for
+    // a client that was mid-edit, and even then left a stale, never-editing
+    // entry behind in every other client's presence map forever). A client
+    // that never sent a PRESENCE message was never in presenceBySocket in
+    // the first place, so there's nothing to tell anyone about.
+    if (presence) {
+      broadcast({ type: "PRESENCE_LEAVE", clientId: presence.clientId } satisfies ServerMessage);
     }
   });
 });

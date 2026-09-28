@@ -45,8 +45,14 @@ function enqueue(write: () => Promise<unknown>) {
 // named field on one of three tables" isn't expressible in Prisma's
 // generated per-model input types without a manual union, so this crosses
 // through `any` deliberately at the boundary.
-function updateEntityField(entityType: EntityType, entityId: string, field: string, value: unknown) {
-  const data = { [field]: value } as any;
+function updateEntityField(
+  entityType: EntityType,
+  entityId: string,
+  field: string,
+  value: unknown,
+  extra?: Record<string, unknown>,
+) {
+  const data = { [field]: value, ...extra } as any;
   switch (entityType) {
     case "board":
       return prisma.board.update({ where: { id: entityId }, data });
@@ -88,8 +94,21 @@ export function applyMutation(
   (entity as unknown as Record<string, unknown>)[field] = value;
   fieldClocks.set(key, clock);
 
+  // updatedAt only exists on Card, and only bumps here — a mutation that
+  // fails the isNewer() check above already returned before this point, so
+  // a rejected stale write never touches it. Set synchronously on the
+  // in-memory entity (read by getFullState()/SYNC_RESPONSE and by index.ts
+  // to attach to the MUTATE broadcast) and persisted in the same write as
+  // the field itself, not a separate one — see the write-ordering note on
+  // `enqueue` above for why that matters.
+  let updatedAt: string | undefined;
+  if (entityType === "card") {
+    updatedAt = new Date().toISOString();
+    (entity as unknown as Record<string, unknown>).updatedAt = updatedAt;
+  }
+
   enqueue(async () => {
-    await updateEntityField(entityType, entityId, field, value);
+    await updateEntityField(entityType, entityId, field, value, updatedAt ? { updatedAt } : undefined);
     await prisma.fieldClock.upsert({
       where: { entityId_field: { entityId, field } },
       create: { entityId, field, lamport: clock.lamport, clientId: clock.clientId },
@@ -119,7 +138,12 @@ export function isTombstoned(entityType: EntityType, entityId: string): boolean 
 
 export function createEntity(entityType: EntityType, entityId: string, initial: Record<string, unknown>) {
   const table = tableFor(entityType) as Map<string, Entity>;
-  const entity = { id: entityId, ...initial } as Entity;
+  // updatedAt is server-authoritative on create, same as every other write
+  // path for it — not trusted from the client's initialValues, even though
+  // it may include one (see createCard() in board-context.tsx, which sets
+  // its own for the creating tab's optimistic local copy only).
+  const values = entityType === "card" ? { ...initial, updatedAt: new Date().toISOString() } : initial;
+  const entity = { id: entityId, ...values } as Entity;
   table.set(entityId, entity);
 
   enqueue(() => createEntityRow(entityType, entity));
@@ -186,6 +210,7 @@ export async function initStore(): Promise<void> {
       description: c.description,
       position: c.position,
       createdAt: c.createdAt.toISOString(),
+      updatedAt: c.updatedAt.toISOString(),
       deletedAt: c.deletedAt ? c.deletedAt.toISOString() : null,
     });
   }

@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { LamportClock } from "@realtime-kanban/shared-types";
 
@@ -17,6 +17,10 @@ vi.mock("@prisma/client", () => {
 });
 
 const { applyDelete, applyMutation, createEntity, isTombstoned, cards } = await import("./store.js");
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("tombstones", () => {
   test("an edit arriving after a delete is dropped, regardless of clock recency", () => {
@@ -73,5 +77,53 @@ describe("tombstones", () => {
 
     expect(applied).toBe(true);
     expect(cards.get(cardId)?.title).toBe("unguarded write");
+  });
+});
+
+describe("Card.updatedAt", () => {
+  test("createEntity sets it, and an applied mutation bumps it", () => {
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const cardId = randomUUID();
+    createEntity("card", cardId, {
+      columnId: "column-1",
+      title: "original",
+      description: "",
+      position: 0,
+      createdAt: new Date().toISOString(),
+      deletedAt: null,
+    });
+    expect(cards.get(cardId)?.updatedAt).toBe("2026-01-01T00:00:00.000Z");
+
+    vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+    const applied = applyMutation("card", cardId, "title", "new title", { lamport: 1, clientId: "a" });
+
+    expect(applied).toBe(true);
+    expect(cards.get(cardId)?.updatedAt).toBe("2026-01-01T00:05:00.000Z");
+  });
+
+  test("a rejected (stale) mutation does not bump it", () => {
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const cardId = randomUUID();
+    createEntity("card", cardId, {
+      columnId: "column-1",
+      title: "original",
+      description: "",
+      position: 0,
+      createdAt: new Date().toISOString(),
+      deletedAt: null,
+    });
+
+    // A real edit first, so there's a field clock for the next one to lose against.
+    vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+    applyMutation("card", cardId, "title", "first edit", { lamport: 5, clientId: "a" });
+    const updatedAtAfterFirstEdit = cards.get(cardId)?.updatedAt;
+
+    vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+    // Lower lamport than the clock already recorded for this field — isNewer() rejects it.
+    const applied = applyMutation("card", cardId, "title", "stale edit", { lamport: 1, clientId: "b" });
+
+    expect(applied).toBe(false);
+    expect(cards.get(cardId)?.title).not.toBe("stale edit");
+    expect(cards.get(cardId)?.updatedAt).toBe(updatedAtAfterFirstEdit);
   });
 });
