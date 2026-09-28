@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useBoard } from "@/lib/board-context";
 import type { Card } from "@realtime-kanban/shared-types";
-import { ACCENT_BORDER, tiltForId, type ColumnAccent } from "@/lib/palette";
+import { ACCENT_BORDER_LEFT, tiltForId, type ColumnAccent } from "@/lib/palette";
 
 export function CardItem({
   card,
@@ -44,7 +44,7 @@ export function CardItem({
       }}
       onDragEnd={() => setIsDragging(false)}
       style={{ "--tilt": tiltForId(card.id) } as React.CSSProperties}
-      className={`group relative bg-white rounded-lg border border-ink/10 border-l-4 ${ACCENT_BORDER[accent]} px-3 py-2.5 text-sm shadow-tactile cursor-grab active:cursor-grabbing rotate-[var(--tilt)] transition-[opacity,box-shadow,transform] duration-150 hover:shadow-tactile-hover hover:-translate-y-0.5 ${
+      className={`group relative bg-white rounded-lg border border-ink/10 border-l-4 ${ACCENT_BORDER_LEFT[accent]} px-3 py-2.5 text-sm shadow-tactile cursor-grab active:cursor-grabbing rotate-[var(--tilt)] transition-[opacity,box-shadow,transform] duration-150 hover:shadow-tactile-hover hover:-translate-y-0.5 ${
         isDragging ? "opacity-40" : "opacity-100"
       }`}
     >

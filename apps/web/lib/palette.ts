@@ -38,6 +38,38 @@ export const ACCENT_BORDER_SOFT: Record<ColumnAccent, string> = {
   pink: "border-accent-pink/40",
 };
 
+// A stronger wash than ACCENT_BG_SOFT, for states that need to read as
+// clearly "active" against the column's own soft-tinted background
+// (e.g. a drop-zone during drag-over).
+export const ACCENT_BG_STRONG: Record<ColumnAccent, string> = {
+  sky: "bg-accent-sky/20",
+  sunflower: "bg-accent-sunflower/20",
+  lavender: "bg-accent-lavender/20",
+  pink: "bg-accent-pink/20",
+};
+
+export const ACCENT_TEXT: Record<ColumnAccent, string> = {
+  sky: "text-accent-sky",
+  sunflower: "text-accent-sunflower",
+  lavender: "text-accent-lavender",
+  pink: "text-accent-pink",
+};
+
+// Directional (border-left-color only) — deliberately distinct from
+// ACCENT_BORDER above. A bare `border-{color}` utility sets border-color on
+// all four sides, which collides with the card's own `border-ink/10` (also
+// an all-sides border-color utility) on the same CSS property: whichever
+// rule Tailwind happens to emit later in the stylesheet wins for all four
+// sides, silently dropping the other. That collision is why the left-edge
+// stripe wasn't visible before — this directional variant only ever touches
+// border-left-color, so it can't stomp on the neutral border.
+export const ACCENT_BORDER_LEFT: Record<ColumnAccent, string> = {
+  sky: "border-l-accent-sky",
+  sunflower: "border-l-accent-sunflower",
+  lavender: "border-l-accent-lavender",
+  pink: "border-l-accent-pink",
+};
+
 // Deterministic per-card tilt so cards don't shift on re-render — hashed
 // from the card id, clamped to a subtle ±1.2deg range.
 export function tiltForId(id: string): string {

@@ -3,7 +3,7 @@
 import { useState, type DragEvent } from "react";
 import { useBoard } from "@/lib/board-context";
 import type { Column } from "@realtime-kanban/shared-types";
-import { ACCENT_BG, ACCENT_BG_SOFT, ACCENT_BORDER_SOFT, type ColumnAccent } from "@/lib/palette";
+import { ACCENT_BG, ACCENT_BG_SOFT, ACCENT_BG_STRONG, ACCENT_BORDER_SOFT, ACCENT_TEXT, type ColumnAccent } from "@/lib/palette";
 import { CardItem } from "./CardItem";
 
 export function ColumnView({ column, accent }: { column: Column; accent: ColumnAccent }) {
@@ -45,23 +45,25 @@ export function ColumnView({ column, accent }: { column: Column; accent: ColumnA
 
   return (
     <div
-      className={`w-72 shrink-0 snap-start rounded-xl p-3 border-2 transition-colors bg-white/60 ${
-        isDragOver ? `${ACCENT_BORDER_SOFT[accent]} ${ACCENT_BG_SOFT[accent]}` : "border-transparent"
+      className={`flex-1 min-w-[280px] max-w-[420px] shrink-0 snap-start rounded-xl p-3 border-2 transition-colors ${ACCENT_BG_SOFT[accent]} ${
+        isDragOver ? `${ACCENT_BORDER_SOFT[accent]} ${ACCENT_BG_STRONG[accent]}` : "border-transparent"
       }`}
       onDragOver={(e) => handleDragOverSlot(e, cardIds.length)}
       onDragLeave={handleDragLeave}
       onDrop={(e) => handleDrop(e, cardIds.length)}
     >
-      <div className="flex items-baseline justify-between mb-2">
-        <h2 className="font-display font-semibold text-sm text-ink">{column.title}</h2>
-        <span className="text-xs text-ink/40 tabular-nums">{cardCount}</span>
+      <div className="flex items-center justify-between mb-2">
+        <h2 className={`font-display font-bold text-sm ${ACCENT_TEXT[accent]}`}>{column.title}</h2>
+        <span className={`text-[11px] font-bold tabular-nums text-white px-1.5 py-0.5 rounded-full ${ACCENT_BG[accent]}`}>
+          {cardCount}
+        </span>
       </div>
-      <div className={`h-1 rounded-full mb-3 ${ACCENT_BG[accent]}`} />
+      <div className={`h-1.5 rounded-full mb-3 ${ACCENT_BG[accent]}`} />
       <div className="space-y-2 min-h-4">
         {cardIds.length === 0 && (
           <div
-            className={`rounded-lg border border-dashed text-center text-xs py-4 transition-colors ${
-              isDragOver ? `${ACCENT_BORDER_SOFT[accent]} ${ACCENT_BG_SOFT[accent]} text-ink/50` : "border-ink/15 text-ink/40"
+            className={`rounded-lg border border-dashed text-center text-xs py-4 transition-colors bg-white/40 ${
+              isDragOver ? `${ACCENT_BORDER_SOFT[accent]} ${ACCENT_BG_STRONG[accent]} ${ACCENT_TEXT[accent]}` : "border-ink/15 text-ink/40"
             }`}
           >
             No cards yet
