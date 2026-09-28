@@ -4,6 +4,7 @@ import { PrismaClient } from "@prisma/client";
 import type { Board, Column, Card, LamportClock, EntityType } from "@realtime-kanban/shared-types";
 import { encodeUpdate } from "@realtime-kanban/shared-types";
 import { isNewer } from "./lww.js";
+import { withBoardSeedLock } from "./board-seed-lock.js";
 
 type Entity = Board | Column | Card;
 
@@ -200,27 +201,29 @@ export async function initStore(): Promise<void> {
 
 /** Seeds a single demo board so the UI has something to render on first run. Only runs if the database is empty. */
 export async function seedDemoBoard(): Promise<void> {
-  const existing = await prisma.board.count();
-  if (existing > 0) return;
+  await withBoardSeedLock(prisma, async (tx) => {
+    const existing = await tx.board.count();
+    if (existing > 0) return;
 
-  const boardId = randomUUID();
-  const board: Board = { id: boardId, name: "Demo Board", createdAt: new Date().toISOString() };
-  boards.set(boardId, board);
-  await prisma.board.create({ data: board });
+    const boardId = randomUUID();
+    const board: Board = { id: boardId, name: "Demo Board", createdAt: new Date().toISOString() };
+    boards.set(boardId, board);
+    await tx.board.create({ data: board });
 
-  const columnTitles = ["To do", "In progress", "Done"];
-  for (const [order, title] of columnTitles.entries()) {
-    const columnId = randomUUID();
-    const column: Column = { id: columnId, boardId, title, order };
-    columns.set(columnId, column);
-    await prisma.column.create({ data: column });
+    const columnTitles = ["To do", "In progress", "Done"];
+    for (const [order, title] of columnTitles.entries()) {
+      const columnId = randomUUID();
+      const column: Column = { id: columnId, boardId, title, order };
+      columns.set(columnId, column);
+      await tx.column.create({ data: column });
 
-    const doc = getColumnDoc(columnId);
-    doc.getArray<string>("cardOrder"); // initialize empty Y.Array
-    await prisma.columnDoc.create({
-      data: { columnId, state: Buffer.from(Y.encodeStateAsUpdate(doc)) },
-    });
-  }
+      const doc = getColumnDoc(columnId);
+      doc.getArray<string>("cardOrder"); // initialize empty Y.Array
+      await tx.columnDoc.create({
+        data: { columnId, state: Buffer.from(Y.encodeStateAsUpdate(doc)) },
+      });
+    }
+  });
 }
 
 export { boards, columns, cards };
