@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
-import type { Board, Card, Column } from "@realtime-kanban/shared-types";
-import { reducer, type BoardState } from "./board-context";
+import type { Board, Card, Column, Presence } from "@realtime-kanban/shared-types";
+import { reducer, presenceReducer, type BoardState } from "./board-context";
 
 function emptyState(): BoardState {
   return { boards: {}, columns: {}, cards: {} };
@@ -15,6 +15,7 @@ const card: Card = {
   description: "",
   position: 0,
   createdAt: "2024-01-01T00:00:00.000Z",
+  updatedAt: "2024-01-01T00:00:00.000Z",
   deletedAt: null,
 };
 
@@ -56,5 +57,37 @@ describe("board-context reducer", () => {
     const next = reducer(state, { type: "REMOVE", table: "cards", id: card.id });
     expect(next.cards[card.id]).toBeUndefined();
     expect(next.boards[board.id]).toEqual(board);
+  });
+});
+
+describe("presenceReducer", () => {
+  // A client that connects and never edits anything — cardId stays null
+  // for its whole session. Presence tracking must count it, not just
+  // clients who have started editing at some point.
+  const alice: Presence = { clientId: "alice", name: "Alice", color: "#111111", cardId: null };
+  const bob: Presence = { clientId: "bob", name: "Bob", color: "#222222", cardId: "card-1" };
+
+  test("PRESENCE_SYNC replaces state with the given list, keyed by clientId", () => {
+    const next = presenceReducer({ stale: { clientId: "stale", name: "Stale", color: "#000", cardId: null } }, {
+      type: "PRESENCE_SYNC",
+      presence: [alice, bob],
+    });
+    expect(next).toEqual({ alice, bob });
+  });
+
+  test("PRESENCE_UPDATE upserts a single client, including a never-editing one", () => {
+    const next = presenceReducer({}, { type: "PRESENCE_UPDATE", presence: alice });
+    expect(next).toEqual({ alice });
+  });
+
+  test("PRESENCE_LEAVE removes a client entirely, regardless of whether it was mid-edit", () => {
+    const state = { alice, bob };
+    expect(presenceReducer(state, { type: "PRESENCE_LEAVE", clientId: "bob" })).toEqual({ alice });
+    expect(presenceReducer(state, { type: "PRESENCE_LEAVE", clientId: "alice" })).toEqual({ bob });
+  });
+
+  test("PRESENCE_LEAVE for a client not currently tracked is a no-op", () => {
+    const state = { alice };
+    expect(presenceReducer(state, { type: "PRESENCE_LEAVE", clientId: "ghost" })).toBe(state);
   });
 });

@@ -1,7 +1,11 @@
 "use client";
 
 import { useBoard } from "@/lib/board-context";
-import { accentForIndex, ACCENT_BG } from "@/lib/palette";
+import { accentForIndex, ACCENT_BG, ACCENT_BORDER_LEFT } from "@/lib/palette";
+import { formatRelativeTime } from "@/lib/time";
+
+// Keeps the widget a quick glance, not a second card list.
+const RECENTLY_ACTIVE_LIMIT = 5;
 
 function DashboardSkeleton() {
   return (
@@ -46,6 +50,10 @@ export function Dashboard() {
     count: activeCards.filter((card) => card.columnId === column.id).length,
   }));
   const maxColumnCount = Math.max(1, ...countsByColumn.map((c) => c.count));
+  const accentByColumnId = new Map(sortedColumns.map((column, index) => [column.id, accentForIndex(index)]));
+  const recentlyActive = [...activeCards]
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+    .slice(0, RECENTLY_ACTIVE_LIMIT);
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-8 py-4 sm:py-8">
@@ -86,10 +94,29 @@ export function Dashboard() {
         </div>
       </div>
 
-      <div className="mt-4 rounded-xl bg-white border border-dashed border-ink/15 p-4 text-sm text-ink/50">
-        Recently active cards needs a <code className="font-mono text-ink/70">Card.updatedAt</code> field that
-        doesn&apos;t exist in the schema yet, so it&apos;s left out here rather than shown with fake timestamps —
-        flagged as a follow-up schema change, not part of this visual pass.
+      <div className="mt-4 rounded-xl bg-white border border-ink/10 p-4 shadow-tactile">
+        <p className="text-xs font-medium text-ink/50 uppercase tracking-wide mb-3">Recently active</p>
+        {recentlyActive.length === 0 ? (
+          <p className="text-sm text-ink/50">No cards yet — recent activity will show up here.</p>
+        ) : (
+          <ul className="space-y-2">
+            {recentlyActive.map((card) => {
+              const accent = accentByColumnId.get(card.columnId) ?? "sky";
+              const column = columns[card.columnId];
+              return (
+                <li
+                  key={card.id}
+                  className={`flex items-center justify-between gap-3 border-l-4 ${ACCENT_BORDER_LEFT[accent]} pl-3 py-1 text-sm`}
+                >
+                  <span className="truncate text-ink">{card.title}</span>
+                  <span className="shrink-0 text-xs text-ink/50">
+                    {column?.title ?? ""} · {formatRelativeTime(card.updatedAt)}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </div>
     </div>
   );

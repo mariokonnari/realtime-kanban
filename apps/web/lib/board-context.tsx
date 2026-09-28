@@ -54,6 +54,34 @@ export interface Editor {
   color: string;
 }
 
+export type PresenceAction =
+  | { type: "PRESENCE_SYNC"; presence: Presence[] }
+  | { type: "PRESENCE_UPDATE"; presence: Presence }
+  | { type: "PRESENCE_LEAVE"; clientId: string };
+
+// Pure, exported for the same reason `reducer` above is: easy to unit test
+// directly, no WebSocket/React plumbing involved. PRESENCE_LEAVE removes
+// the client entirely (not just clearing cardId) — that's the fix for a
+// client lingering as a stale "collaborator" after it disconnects,
+// including one that never edited anything (cardId was always null).
+export function presenceReducer(
+  state: Record<string, Presence>,
+  action: PresenceAction,
+): Record<string, Presence> {
+  switch (action.type) {
+    case "PRESENCE_SYNC":
+      return Object.fromEntries(action.presence.map((p) => [p.clientId, p]));
+    case "PRESENCE_UPDATE":
+      return { ...state, [action.presence.clientId]: action.presence };
+    case "PRESENCE_LEAVE": {
+      if (!(action.clientId in state)) return state;
+      const next = { ...state };
+      delete next[action.clientId];
+      return next;
+    }
+  }
+}
+
 interface BoardApi extends BoardState {
   columnOrder: Record<string, string[]>;
   editorsByCard: Record<string, Editor[]>;
@@ -102,6 +130,17 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     wsClient.connect();
+    // Announce presence immediately on connect (cardId: null — "here, not
+    // editing anything"), not only when starting/stopping an edit. Without
+    // this, a client that never edits anything is invisible to every other
+    // client's presence map and never counted as a live collaborator.
+    wsClient.send({
+      type: "PRESENCE",
+      clientId: getClientId(),
+      name: presenceIdentity.name,
+      color: presenceIdentity.color,
+      cardId: null,
+    });
     return wsClient.subscribe((message: ServerMessage) => {
       switch (message.type) {
         case "SYNC_RESPONSE": {
@@ -110,18 +149,25 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
             Y.applyUpdate(getDoc(columnId), decodeUpdate(base64));
           });
           setPresenceByClient(
-            Object.fromEntries(
-              message.presence.filter((p) => p.clientId !== getClientId()).map((p) => [p.clientId, p]),
+            presenceReducer(
+              {},
+              { type: "PRESENCE_SYNC", presence: message.presence.filter((p) => p.clientId !== getClientId()) },
             ),
           );
           break;
         }
         case "PRESENCE": {
           if (message.clientId === getClientId()) break; // never track our own tab
-          setPresenceByClient((prev) => ({
-            ...prev,
-            [message.clientId]: { clientId: message.clientId, name: message.name, color: message.color, cardId: message.cardId },
-          }));
+          setPresenceByClient((prev) =>
+            presenceReducer(prev, {
+              type: "PRESENCE_UPDATE",
+              presence: { clientId: message.clientId, name: message.name, color: message.color, cardId: message.cardId },
+            }),
+          );
+          break;
+        }
+        case "PRESENCE_LEAVE": {
+          setPresenceByClient((prev) => presenceReducer(prev, { type: "PRESENCE_LEAVE", clientId: message.clientId }));
           break;
         }
         case "CREATE": {
@@ -132,6 +178,9 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
         case "MUTATE": {
           const table: Table = message.entityType === "card" ? "cards" : message.entityType === "column" ? "columns" : "boards";
           dispatch({ type: "PATCH", table, id: message.entityId, field: message.field, value: message.value });
+          if (message.entityType === "card" && message.updatedAt) {
+            dispatch({ type: "PATCH", table: "cards", id: message.entityId, field: "updatedAt", value: message.updatedAt });
+          }
           break;
         }
         case "DELETE": {
@@ -148,6 +197,11 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
 
   const updateCardField = useCallback((cardId: string, field: "title" | "description", value: string) => {
     dispatch({ type: "PATCH", table: "cards", id: cardId, field, value });
+    // Optimistic local bump — the server broadcast carries its own
+    // authoritative updatedAt back to *other* clients (see MUTATE handling
+    // above), but a MUTATE is never echoed back to its own sender, so this
+    // is the only way this tab's own dashboard view reflects its own edit.
+    dispatch({ type: "PATCH", table: "cards", id: cardId, field: "updatedAt", value: new Date().toISOString() });
     wsClient.send({ type: "MUTATE", entityType: "card", entityId: cardId, field, value, clock: nextClock() });
   }, []);
 
@@ -160,6 +214,7 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
         description: "",
         position: 0,
         createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
         deletedAt: null,
       };
       dispatch({ type: "UPSERT", table: "cards", id, entity: { id, ...initialValues } as Card });
@@ -182,6 +237,7 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
     (cardId: string, fromColumnId: string, toColumnId: string, toIndex: number) => {
       if (fromColumnId !== toColumnId) {
         dispatch({ type: "PATCH", table: "cards", id: cardId, field: "columnId", value: toColumnId });
+        dispatch({ type: "PATCH", table: "cards", id: cardId, field: "updatedAt", value: new Date().toISOString() });
         wsClient.send({
           type: "MUTATE",
           entityType: "card",
