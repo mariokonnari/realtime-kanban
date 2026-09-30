@@ -6,6 +6,8 @@ single-value fields, and CRDTs (Yjs) for concurrent list ordering.
 
 **Live demo:** https://realtime-kanban-mu.vercel.app
 
+![Two clients editing the same card concurrently, with overlapping presence tags](apps/web/public/demo/realtimekanban.gif)
+
 **Status: the core real-time loop is built and verified — board UI,
 WebSocket client, LWW mutations, CRDT card ordering, tombstoned
 deletes, sync-on-connect for late joiners, Postgres persistence, and
