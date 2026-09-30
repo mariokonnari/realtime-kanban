@@ -11,8 +11,9 @@ single-value fields, and CRDTs (Yjs) for concurrent list ordering.
 **Status: the core real-time loop is built and verified — board UI,
 WebSocket client, LWW mutations, CRDT card ordering, tombstoned
 deletes, sync-on-connect for late joiners, Postgres persistence, and
-lightweight per-tab presence all work end to end.** Auth, an offline
-queue, and column management UI are the remaining gaps (see below).
+lightweight per-tab presence, and a durable offline queue all work end
+to end.** Auth and column management UI are the remaining gaps (see
+below).
 
 ## Architecture
 
@@ -101,6 +102,16 @@ frames — an acceptable tradeoff at this scale.
 server replies with every board/column/non-tombstoned-card plus each
 column's full CRDT state, so a client joining mid-session sees
 current state immediately instead of waiting for the next edit.
+
+**Offline queue:** while the socket isn't open, outbound `MUTATE`,
+`CREATE`, `DELETE`, and `CRDT_UPDATE` messages are queued durably in
+IndexedDB (`apps/web/lib/offline-queue.ts`) instead of being dropped.
+On reconnect the client sends `SYNC_REQUEST` first, then replays the
+queue in insertion order, deleting each entry after it's sent; entries
+left by a closed tab or a reload are replayed the same way.
+`PRESENCE` is not queued — it's ephemeral and sent fresh on connect.
+The top bar shows "Offline — N pending" (or "Syncing — N pending"
+while draining) until the queue is empty.
 
 ## Dashboard
 
@@ -255,10 +266,21 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
 - **No auth** — anyone with the URL can edit or delete anything. The
   project is about sync strategies, so identity was left out of scope;
   a `clientId` is just a per-tab tiebreaker for LWW, not a user.
-- **No offline queue** — edits made while disconnected are lost, not
-  queued for replay on reconnect. The client's WebSocket reconnects on
-  drop (naive fixed-delay, no backoff), but `ws-client.ts` only sends
-  while the socket is open and has no outbox to buffer or replay from.
+- **Duplicate sends are possible.** If a tab closes between sending a
+  queued entry and deleting it from IndexedDB, that entry replays again
+  on next load. The server's `CREATE` isn't idempotent, so a duplicate
+  send resets that card's fields rather than being silently ignored, and
+  there's no ack protocol to prevent it.
+- **A client that loses an LWW conflict while online is never told it
+  lost.** The offline queue's post-replay sync fixes this for the
+  reconnect case only; the general case predates the queue and is out of
+  its scope, since the server drops a stale write without replying.
+- **The queue's fallback and concurrency paths are untested.** Without
+  IndexedDB access (some private-browsing modes block it entirely) the
+  queue degrades to in-memory only for that session: queued edits still
+  replay, but won't survive a reload. That path, two tabs draining the
+  queue concurrently, and a tab closing mid-drain have no automated
+  tests.
 - **Test coverage is unit-level, not end-to-end.**
   `apps/server/src/*.test.ts` covers the LWW tie-breaking rules, the
   CRDT-vs-naive-LWW ordering guarantee side by side, and tombstone
