@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { Board, Card, Column, Presence } from "@realtime-kanban/shared-types";
-import { reducer, presenceReducer, type BoardState } from "./board-context";
+import { reducer, presenceReducer, actionsForUnsynced, type BoardState } from "./board-context";
 
 function emptyState(): BoardState {
   return { boards: {}, columns: {}, cards: {} };
@@ -89,5 +89,34 @@ describe("presenceReducer", () => {
   test("PRESENCE_LEAVE for a client not currently tracked is a no-op", () => {
     const state = { alice };
     expect(presenceReducer(state, { type: "PRESENCE_LEAVE", clientId: "ghost" })).toBe(state);
+  });
+});
+
+describe("actionsForUnsynced", () => {
+  const clock = { lamport: 1, clientId: "me" };
+
+  test("re-applying a SYNC-wiped local create, edit and delete leaves the screen as the user left it", () => {
+    // The server's SYNC_RESPONSE knows none of these yet.
+    const synced = reducer(emptyState(), { type: "SYNC", boards: [board], columns: [column], cards: [] });
+    const actions = actionsForUnsynced([
+      { type: "CREATE", entityType: "card", entityId: "new-1", initialValues: { columnId: "col-1", title: "Draft" }, clock },
+      { type: "MUTATE", entityType: "card", entityId: "new-1", field: "title", value: "Final", clock },
+      { type: "CREATE", entityType: "card", entityId: "new-2", initialValues: { columnId: "col-1", title: "Doomed" }, clock },
+      { type: "DELETE", entityType: "card", entityId: "new-2", clock },
+    ]);
+
+    const next = actions.reduce(reducer, synced);
+
+    expect(Object.keys(next.cards)).toEqual(["new-1"]);
+    expect(next.cards["new-1"].title).toBe("Final");
+  });
+
+  test("ignores messages that have no effect on the board tables", () => {
+    expect(
+      actionsForUnsynced([
+        { type: "CRDT_UPDATE", columnId: "col-1", update: "AAA=" },
+        { type: "SYNC_REQUEST" },
+      ]),
+    ).toEqual([]);
   });
 });

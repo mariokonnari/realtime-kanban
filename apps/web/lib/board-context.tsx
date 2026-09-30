@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import * as Y from "yjs";
-import type { Board, Column, Card, Presence, ServerMessage } from "@realtime-kanban/shared-types";
+import type { Board, Column, Card, ClientMessage, Presence, ServerMessage } from "@realtime-kanban/shared-types";
 import { encodeUpdate, decodeUpdate } from "@realtime-kanban/shared-types";
 import { wsClient, nextClock, getClientId, presenceIdentity } from "./ws-client";
 
@@ -47,6 +47,43 @@ export function reducer(state: BoardState, action: Action): BoardState {
       return { ...state, [action.table]: next };
     }
   }
+}
+
+function tableForEntity(entityType: "board" | "column" | "card"): Table {
+  return entityType === "card" ? "cards" : entityType === "column" ? "columns" : "boards";
+}
+
+// Local edits the server's SYNC_RESPONSE doesn't reflect yet (still queued, or
+// sent after the sync request). The server never echoes a message back to its
+// sender, so without re-applying these a reconnect's SYNC would wipe the
+// sender's own optimistic changes from the screen. Pure, like `reducer`.
+export function actionsForUnsynced(messages: ClientMessage[]): Action[] {
+  const actions: Action[] = [];
+  for (const message of messages) {
+    switch (message.type) {
+      case "CREATE":
+        actions.push({
+          type: "UPSERT",
+          table: tableForEntity(message.entityType),
+          id: message.entityId,
+          entity: { id: message.entityId, ...message.initialValues } as Card,
+        });
+        break;
+      case "MUTATE":
+        actions.push({
+          type: "PATCH",
+          table: tableForEntity(message.entityType),
+          id: message.entityId,
+          field: message.field,
+          value: message.value,
+        });
+        break;
+      case "DELETE":
+        actions.push({ type: "REMOVE", table: tableForEntity(message.entityType), id: message.entityId });
+        break;
+    }
+  }
+  return actions;
 }
 
 export interface Editor {
@@ -148,6 +185,15 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
           Object.entries(message.columnOrders).forEach(([columnId, base64]) => {
             Y.applyUpdate(getDoc(columnId), decodeUpdate(base64));
           });
+          // Server state first, then local pending ops on top of it. Yjs
+          // updates are idempotent, so re-applying ones this tab's doc
+          // already has is harmless — and after a reload they're what puts
+          // queued cards back into the column order.
+          const unsynced = wsClient.takeUnsynced();
+          actionsForUnsynced(unsynced).forEach(dispatch);
+          for (const pending of unsynced) {
+            if (pending.type === "CRDT_UPDATE") Y.applyUpdate(getDoc(pending.columnId), decodeUpdate(pending.update));
+          }
           setPresenceByClient(
             presenceReducer(
               {},
