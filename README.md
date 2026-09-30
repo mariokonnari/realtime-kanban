@@ -4,6 +4,8 @@ A real-time collaborative Kanban board demonstrating two concurrency
 strategies side by side: last-write-wins (LWW) registers for
 single-value fields, and CRDTs (Yjs) for concurrent list ordering.
 
+**Live demo:** https://realtime-kanban-mu.vercel.app
+
 **Status: the core real-time loop is built and verified — board UI,
 WebSocket client, LWW mutations, CRDT card ordering, tombstoned
 deletes, sync-on-connect for late joiners, Postgres persistence, and
@@ -98,6 +100,13 @@ server replies with every board/column/non-tombstoned-card plus each
 column's full CRDT state, so a client joining mid-session sees
 current state immediately instead of waiting for the next edit.
 
+## Dashboard
+
+**"Recently active"** ranks cards by `Card.updatedAt`, which is bumped
+when a card is created or when a card field (title, description, or
+which column it's in) changes. Reordering within a column is a CRDT
+update, not a field mutation, so it doesn't count.
+
 ## Persistence
 
 `apps/server/src/store.ts` is backed by Postgres via Prisma
@@ -123,7 +132,7 @@ See "Running this locally" above for the local Postgres setup.
 
 ## Deployment
 
-**Live demo:** _not yet deployed — see steps below_
+**Live demo:** https://realtime-kanban-mu.vercel.app
 
 Three separate services, matching "Architecture" above: `apps/web` →
 Vercel, `apps/server` → Render, Postgres → Supabase (chosen over
@@ -241,10 +250,13 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
 
 ## Known gaps
 
-- **No auth** — anyone who connects can edit anything.
-- **No offline queue / reconnect sync** — the client's WebSocket
-  reconnects on drop (naive fixed-delay, no backoff), but any edits
-  made while disconnected are lost, not queued.
+- **No auth** — anyone with the URL can edit or delete anything. The
+  project is about sync strategies, so identity was left out of scope;
+  a `clientId` is just a per-tab tiebreaker for LWW, not a user.
+- **No offline queue** — edits made while disconnected are lost, not
+  queued for replay on reconnect. The client's WebSocket reconnects on
+  drop (naive fixed-delay, no backoff), but `ws-client.ts` only sends
+  while the socket is open and has no outbox to buffer or replay from.
 - **Test coverage is unit-level, not end-to-end.**
   `apps/server/src/*.test.ts` covers the LWW tie-breaking rules, the
   CRDT-vs-naive-LWW ordering guarantee side by side, and tombstone
@@ -252,8 +264,23 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
   `CardItem`. Nothing drives the actual WebSocket server end-to-end,
   and `Board.tsx`/`Column.tsx` and the drag-and-drop interaction
   aren't covered.
-- **No column management UI** — columns are fixed at three, seeded
-  server-side.
+- **No board/column management UI** — one board, three fixed columns,
+  seeded server-side. Column order is a plain field (not a CRDT) and
+  the UI only ever renders the first board, so nothing needed to
+  create, rename, or reorder them yet.
+- **Seed-order regression tests skip silently without local Postgres.**
+  `seed-order.test.ts` talks to a real database and only runs when
+  `DATABASE_URL` points at localhost (the same guard the seed script
+  uses, so tests can never touch a remote DB). With no local Postgres
+  running they're skipped, not failed, so a green run doesn't prove
+  they passed.
+- **A process that loses the board-seeding race can serve an empty
+  board.** The advisory lock in `board-seed-lock.ts` guarantees exactly
+  one board is created even when several server instances start at
+  once, but `index.ts` runs `initStore()` before `seedDemoBoard()`. A
+  loser of that race loaded state before the winner committed, sees the
+  board already exists, and doesn't reload — so it serves an empty
+  board until its next restart.
 - **Presence is best-effort, not persisted** — editing badges are
   relayed live between connected clients and included in
   `SYNC_RESPONSE` for late joiners, but there's no history once a
