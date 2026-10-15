@@ -35,9 +35,24 @@ function fieldKey(entityId: string, field: string) {
 // write for an earlier (losing) clock could complete after a faster write
 // for a later (winning) one and leave the DB holding the stale value — the
 // exact "old edit resurrects itself on restart" bug persistence must avoid.
-let writeQueue: Promise<unknown> = Promise.resolve();
-function enqueue(write: () => Promise<unknown>) {
-  writeQueue = writeQueue.then(write, write);
+//
+// A failed write is logged (with `context`, so the log says which entity/field)
+// and swallowed here: nothing awaits this chain, so letting the rejection
+// escape would be an unhandled rejection, which terminates the Node process —
+// and a rejected link would also skip every write queued behind it.
+let writeQueue: Promise<void> = Promise.resolve();
+function enqueue(context: string, write: () => Promise<unknown>): Promise<void> {
+  writeQueue = writeQueue.then(write).then(
+    () => undefined,
+    (error) => {
+      console.error(`DB write failed (${context}):`, error);
+    },
+  );
+  return writeQueue;
+}
+
+/** Resolves once every write queued so far has finished (successfully or not). Used by tests. */
+export function flushWrites(): Promise<void> {
   return writeQueue;
 }
 
@@ -107,7 +122,7 @@ export function applyMutation(
     (entity as unknown as Record<string, unknown>).updatedAt = updatedAt;
   }
 
-  enqueue(async () => {
+  enqueue(`update ${entityType} ${entityId} field "${field}"`, async () => {
     await updateEntityField(entityType, entityId, field, value, updatedAt ? { updatedAt } : undefined);
     await prisma.fieldClock.upsert({
       where: { entityId_field: { entityId, field } },
@@ -126,7 +141,7 @@ export function applyDelete(entityType: EntityType, entityId: string): boolean {
   const deletedAt = new Date().toISOString();
   (entity as Card).deletedAt = deletedAt;
 
-  enqueue(() => prisma.card.update({ where: { id: entityId }, data: { deletedAt } }));
+  enqueue(`tombstone card ${entityId}`, () => prisma.card.update({ where: { id: entityId }, data: { deletedAt } }));
 
   return true;
 }
@@ -136,8 +151,15 @@ export function isTombstoned(entityType: EntityType, entityId: string): boolean 
   return cards.get(entityId)?.deletedAt != null;
 }
 
-export function createEntity(entityType: EntityType, entityId: string, initial: Record<string, unknown>) {
+/**
+ * Creates the entity unless one with this id already exists — tombstoned
+ * cards included, since initStore() loads those too, so a replayed CREATE can
+ * never overwrite a live card or resurrect a deleted one. Returns whether it
+ * created anything; the caller must not broadcast when it didn't.
+ */
+export function createEntity(entityType: EntityType, entityId: string, initial: Record<string, unknown>): boolean {
   const table = tableFor(entityType) as Map<string, Entity>;
+  if (table.has(entityId)) return false;
   // updatedAt is server-authoritative on create, same as every other write
   // path for it — not trusted from the client's initialValues, even though
   // it may include one (see createCard() in board-context.tsx, which sets
@@ -146,7 +168,8 @@ export function createEntity(entityType: EntityType, entityId: string, initial: 
   const entity = { id: entityId, ...values } as Entity;
   table.set(entityId, entity);
 
-  enqueue(() => createEntityRow(entityType, entity));
+  enqueue(`create ${entityType} ${entityId}`, () => createEntityRow(entityType, entity));
+  return true;
 }
 
 export function getColumnDoc(columnId: string): Y.Doc {
@@ -163,7 +186,7 @@ export function persistColumnDoc(columnId: string): void {
   const doc = columnDocs.get(columnId);
   if (!doc) return;
   const state = Buffer.from(Y.encodeStateAsUpdate(doc));
-  enqueue(() =>
+  enqueue(`persist column doc ${columnId}`, () =>
     prisma.columnDoc.upsert({
       where: { columnId },
       create: { columnId, state },
