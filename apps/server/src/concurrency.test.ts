@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import * as Y from "yjs";
 import type { LamportClock } from "@realtime-kanban/shared-types";
-import { isNewer } from "./lww.js";
+import { isNewer } from "@realtime-kanban/shared-types";
 
 // Why Card.position is Y.Array and not a naive LWW register — see
 // README.md's "Sync strategy per field" table. These two tests are meant

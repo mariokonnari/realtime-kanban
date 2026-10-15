@@ -1,4 +1,5 @@
 export * from "./binary.js";
+export * from "./lww.js";
 
 // ---- Conflict resolution primitives ----
 
@@ -115,6 +116,11 @@ export interface SyncResponseMessage {
   cards: Card[]; // tombstoned cards are excluded, not sent
   columnOrders: Record<string, string>; // columnId -> base64 full Y.Doc state
   presence: Presence[]; // who else is currently editing what, for late joiners
+  // The winning clock of every LWW field the server has applied for the
+  // entities above, keyed by fieldKey(entityId, field). Lets a client compare
+  // later remote writes against the same clocks the server uses. Additive:
+  // optional because an older server doesn't send it.
+  fieldClocks?: Record<string, LamportClock>;
 }
 
 export type ClientMessage =

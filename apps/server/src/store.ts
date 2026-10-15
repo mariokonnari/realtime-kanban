@@ -2,8 +2,7 @@ import * as Y from "yjs";
 import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import type { Board, Column, Card, LamportClock, EntityType } from "@realtime-kanban/shared-types";
-import { encodeUpdate } from "@realtime-kanban/shared-types";
-import { isNewer } from "./lww.js";
+import { encodeUpdate, isNewer, fieldKey } from "@realtime-kanban/shared-types";
 import { withBoardSeedLock } from "./board-seed-lock.js";
 
 type Entity = Board | Column | Card;
@@ -22,10 +21,6 @@ const columnDocs = new Map<string, Y.Doc>();
 
 function tableFor(entityType: EntityType) {
   return entityType === "board" ? boards : entityType === "column" ? columns : cards;
-}
-
-function fieldKey(entityId: string, field: string) {
-  return `${entityId}:${field}`;
 }
 
 // DB writes are async, but the in-memory LWW check-and-set above is
@@ -201,11 +196,18 @@ export function getFullState() {
   for (const [columnId, doc] of columnDocs.entries()) {
     columnOrders[columnId] = encodeUpdate(Y.encodeStateAsUpdate(doc));
   }
+  const sentCards = [...cards.values()].filter((c) => c.deletedAt == null);
+  const sentIds = new Set([...boards.keys(), ...columns.keys(), ...sentCards.map((c) => c.id)]);
+  const sentFieldClocks: Record<string, LamportClock> = {};
+  for (const [key, clock] of fieldClocks) {
+    if (sentIds.has(key.slice(0, key.indexOf(":")))) sentFieldClocks[key] = clock;
+  }
   return {
     boards: [...boards.values()],
     columns: [...columns.values()],
-    cards: [...cards.values()].filter((c) => c.deletedAt == null),
+    cards: sentCards,
     columnOrders,
+    fieldClocks: sentFieldClocks,
   };
 }
 

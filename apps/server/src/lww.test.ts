@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { LamportClock } from "@realtime-kanban/shared-types";
-import { isNewer } from "./lww.js";
+import { isNewer } from "@realtime-kanban/shared-types";
 
 describe("isNewer", () => {
   test("accepts any clock when there is no current clock yet", () => {
