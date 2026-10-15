@@ -1,0 +1,9 @@
+{
+  // Same compiler options as the app, but includes the test files that
+  // tsconfig.json excludes so `next build` doesn't type-check them. Some tests
+  // (convergence.e2e.test.tsx) import test support from apps/server, so this
+  // also type-checks that source.
+  "extends": "./tsconfig.json",
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}
