@@ -5,6 +5,7 @@ import * as Y from "yjs";
 import type { Board, Column, Card, ClientMessage, Presence, ServerMessage } from "@realtime-kanban/shared-types";
 import { encodeUpdate, decodeUpdate } from "@realtime-kanban/shared-types";
 import { wsClient, nextClock, getClientId, presenceIdentity } from "./ws-client";
+import { FieldClocks } from "./field-clocks";
 
 export interface BoardState {
   boards: Record<string, Board>;
@@ -56,8 +57,11 @@ function tableForEntity(entityType: "board" | "column" | "card"): Table {
 // Local edits the server's SYNC_RESPONSE doesn't reflect yet (still queued, or
 // sent after the sync request). The server never echoes a message back to its
 // sender, so without re-applying these a reconnect's SYNC would wipe the
-// sender's own optimistic changes from the screen. Pure, like `reducer`.
-export function actionsForUnsynced(messages: ClientMessage[]): Action[] {
+// sender's own optimistic changes from the screen. Edits go through the same
+// clock check as any remote write: one the synced state already beats (the
+// server rejected it, or will) is not put back on screen. Pure apart from
+// recording the clocks of the edits it re-applies.
+export function actionsForUnsynced(messages: ClientMessage[], clocks: FieldClocks): Action[] {
   const actions: Action[] = [];
   for (const message of messages) {
     switch (message.type) {
@@ -70,6 +74,7 @@ export function actionsForUnsynced(messages: ClientMessage[]): Action[] {
         });
         break;
       case "MUTATE":
+        if (!clocks.accept(message.entityId, message.field, message.clock)) break;
         actions.push({
           type: "PATCH",
           table: tableForEntity(message.entityType),
@@ -148,6 +153,8 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
   // our own tab, since the server excludes the sender from broadcasts.
   const [presenceByClient, setPresenceByClient] = useState<Record<string, Presence>>({});
   const docsRef = useRef<Map<string, Y.Doc>>(new Map());
+  // The server's per-field clocks as this replica knows them — see field-clocks.ts.
+  const clocksRef = useRef(new FieldClocks());
 
   // Gets (or lazily creates) the Y.Doc for a column and wires its
   // Y.Array observer to React state — this is the seam where CRDT
@@ -182,6 +189,7 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
       switch (message.type) {
         case "SYNC_RESPONSE": {
           dispatch({ type: "SYNC", boards: message.boards, columns: message.columns, cards: message.cards });
+          clocksRef.current.reset(message.fieldClocks);
           Object.entries(message.columnOrders).forEach(([columnId, base64]) => {
             Y.applyUpdate(getDoc(columnId), decodeUpdate(base64));
           });
@@ -190,7 +198,7 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
           // already has is harmless — and after a reload they're what puts
           // queued cards back into the column order.
           const unsynced = wsClient.takeUnsynced();
-          actionsForUnsynced(unsynced).forEach(dispatch);
+          actionsForUnsynced(unsynced, clocksRef.current).forEach(dispatch);
           for (const pending of unsynced) {
             if (pending.type === "CRDT_UPDATE") Y.applyUpdate(getDoc(pending.columnId), decodeUpdate(pending.update));
           }
@@ -222,6 +230,9 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
           break;
         }
         case "MUTATE": {
+          // Same rule the server applies: a write that doesn't beat the field's
+          // current clock is stale, however late or early it arrived.
+          if (!clocksRef.current.accept(message.entityId, message.field, message.clock)) break;
           const table: Table = message.entityType === "card" ? "cards" : message.entityType === "column" ? "columns" : "boards";
           dispatch({ type: "PATCH", table, id: message.entityId, field: message.field, value: message.value });
           if (message.entityType === "card" && message.updatedAt) {
@@ -248,7 +259,9 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
     // above), but a MUTATE is never echoed back to its own sender, so this
     // is the only way this tab's own dashboard view reflects its own edit.
     dispatch({ type: "PATCH", table: "cards", id: cardId, field: "updatedAt", value: new Date().toISOString() });
-    wsClient.send({ type: "MUTATE", entityType: "card", entityId: cardId, field, value, clock: nextClock() });
+    const clock = nextClock();
+    clocksRef.current.accept(cardId, field, clock);
+    wsClient.send({ type: "MUTATE", entityType: "card", entityId: cardId, field, value, clock });
   }, []);
 
   const createCard = useCallback(
@@ -284,13 +297,15 @@ export function BoardProvider({ children }: { children: React.ReactNode }) {
       if (fromColumnId !== toColumnId) {
         dispatch({ type: "PATCH", table: "cards", id: cardId, field: "columnId", value: toColumnId });
         dispatch({ type: "PATCH", table: "cards", id: cardId, field: "updatedAt", value: new Date().toISOString() });
+        const clock = nextClock();
+        clocksRef.current.accept(cardId, "columnId", clock);
         wsClient.send({
           type: "MUTATE",
           entityType: "card",
           entityId: cardId,
           field: "columnId",
           value: toColumnId,
-          clock: nextClock(),
+          clock,
         });
       }
 

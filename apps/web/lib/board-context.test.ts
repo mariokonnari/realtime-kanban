@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { Board, Card, Column, Presence } from "@realtime-kanban/shared-types";
+import { FieldClocks } from "./field-clocks";
 import { reducer, presenceReducer, actionsForUnsynced, type BoardState } from "./board-context";
 
 function emptyState(): BoardState {
@@ -103,7 +104,7 @@ describe("actionsForUnsynced", () => {
       { type: "MUTATE", entityType: "card", entityId: "new-1", field: "title", value: "Final", clock },
       { type: "CREATE", entityType: "card", entityId: "new-2", initialValues: { columnId: "col-1", title: "Doomed" }, clock },
       { type: "DELETE", entityType: "card", entityId: "new-2", clock },
-    ]);
+    ], new FieldClocks());
 
     const next = actions.reduce(reducer, synced);
 
@@ -111,12 +112,43 @@ describe("actionsForUnsynced", () => {
     expect(next.cards["new-1"].title).toBe("Final");
   });
 
+  test("an unsynced edit the synced state already beats is not put back on screen; one that beats it is", () => {
+    const clocks = new FieldClocks();
+    clocks.reset({ "card-1:title": { lamport: 10, clientId: "them" } }); // from SYNC_RESPONSE
+    const edit = (field: string, value: string, lamport: number) =>
+      ({ type: "MUTATE", entityType: "card", entityId: "card-1", field, value, clock: { lamport, clientId: "me" } }) as const;
+
+    const actions = actionsForUnsynced(
+      [edit("title", "stale", 3), edit("description", "newer", 3), edit("title", "wins", 11)],
+      clocks,
+    );
+
+    expect(actions.map((a) => (a.type === "PATCH" ? [a.field, a.value] : null))).toEqual([
+      ["description", "newer"], // no server clock for this field yet
+      ["title", "wins"],
+    ]);
+  });
+
+  test("re-applying the same unsynced edit twice is a no-op the second time", () => {
+    const clocks = new FieldClocks();
+    const edit = {
+      type: "MUTATE",
+      entityType: "card",
+      entityId: "card-1",
+      field: "title",
+      value: "x",
+      clock: { lamport: 4, clientId: "me" },
+    } as const;
+    expect(actionsForUnsynced([edit], clocks)).toHaveLength(1);
+    expect(actionsForUnsynced([edit], clocks)).toHaveLength(0);
+  });
+
   test("ignores messages that have no effect on the board tables", () => {
     expect(
       actionsForUnsynced([
         { type: "CRDT_UPDATE", columnId: "col-1", update: "AAA=" },
         { type: "SYNC_REQUEST" },
-      ]),
+      ], new FieldClocks()),
     ).toEqual([]);
   });
 });

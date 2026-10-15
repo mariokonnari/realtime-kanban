@@ -25,6 +25,14 @@ export function observeClock(seen: number) {
   if (seen > lamport) lamport = seen;
 }
 
+function observeServerClocks(message: ServerMessage) {
+  if (message.type === "SYNC_RESPONSE") {
+    for (const clock of Object.values(message.fieldClocks ?? {})) observeClock(clock.lamport);
+  } else if ("clock" in message) {
+    observeClock(message.clock.lamport);
+  }
+}
+
 export function getClientId() {
   return clientId;
 }
@@ -127,6 +135,9 @@ export class WsClient {
 
     socket.addEventListener("message", (event) => {
       const message = JSON.parse(event.data) as ServerMessage;
+      // Any clock we see, ours must end up above: otherwise an edit made
+      // after seeing someone else's would stamp a lower clock and lose to it.
+      observeServerClocks(message);
       this.listeners.forEach((listener) => listener(message));
     });
 

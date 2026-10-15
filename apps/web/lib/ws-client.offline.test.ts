@@ -34,6 +34,11 @@ class FakeWebSocket {
     this.emit("open", {});
   }
 
+  /** Delivers a frame from the server. */
+  receive(message: unknown) {
+    this.emit("message", { data: JSON.stringify(message) });
+  }
+
   drop() {
     this.readyState = FakeWebSocket.CLOSED;
     this.emit("close", {});
@@ -256,6 +261,57 @@ describe("WsClient offline queue", () => {
     await vi.waitFor(() => expect(client.getStatus().pending).toBe(1));
 
     expect(nextClock().lamport).toBeGreaterThan(40);
+  });
+
+  test("receiving a MUTATE, CREATE or DELETE moves our clock past the one it carries", async () => {
+    const client = newClient();
+    const socket = await connectedSocket(client);
+    socket.open();
+    const remote = (lamport: number) => ({ lamport, clientId: "someone-else" });
+
+    socket.receive({ type: "MUTATE", entityType: "card", entityId: "c", field: "title", value: "x", clock: remote(1_000) });
+    expect(nextClock().lamport).toBeGreaterThan(1_000);
+
+    socket.receive({ type: "CREATE", entityType: "card", entityId: "c", initialValues: {}, clock: remote(2_000) });
+    expect(nextClock().lamport).toBeGreaterThan(2_000);
+
+    socket.receive({ type: "DELETE", entityType: "card", entityId: "c", clock: remote(3_000) });
+    expect(nextClock().lamport).toBeGreaterThan(3_000);
+  });
+
+  test("a SYNC_RESPONSE moves our clock past every field clock in it; a message with no clock moves nothing", async () => {
+    const client = newClient();
+    const socket = await connectedSocket(client);
+    socket.open();
+
+    socket.receive({
+      type: "SYNC_RESPONSE",
+      boards: [],
+      columns: [],
+      cards: [],
+      columnOrders: {},
+      presence: [],
+      fieldClocks: {
+        "c:title": { lamport: 4_000, clientId: "x" },
+        "c:description": { lamport: 9_000, clientId: "y" },
+      },
+    });
+    const afterSync = nextClock().lamport;
+    expect(afterSync).toBeGreaterThan(9_000);
+
+    socket.receive({ type: "PRESENCE", clientId: "z", name: "n", color: "#000", cardId: null });
+    expect(nextClock().lamport).toBe(afterSync + 1);
+  });
+
+  test("a SYNC_RESPONSE from an older server, with no fieldClocks, is handled", async () => {
+    const client = newClient();
+    const socket = await connectedSocket(client);
+    socket.open();
+    const before = nextClock().lamport;
+
+    socket.receive({ type: "SYNC_RESPONSE", boards: [], columns: [], cards: [], columnOrders: {}, presence: [] });
+
+    expect(nextClock().lamport).toBe(before + 1);
   });
 
   test("without IndexedDB it degrades to an in-memory queue and still replays", async () => {
