@@ -170,13 +170,32 @@ export function createEntity(entityType: EntityType, entityId: string, initial: 
   return true;
 }
 
-export function getColumnDoc(columnId: string): Y.Doc {
+// Private on purpose: this registers a doc (and so lists it in every
+// SYNC_RESPONSE) for whatever id it is given. Anything that takes a column id
+// from a client goes through columnDocFor() below, which only ever creates one
+// for a column that exists.
+function getColumnDoc(columnId: string): Y.Doc {
   let doc = columnDocs.get(columnId);
   if (!doc) {
     doc = new Y.Doc();
     columnDocs.set(columnId, doc);
   }
   return doc;
+}
+
+/** Whether this id names a column the server knows about. Registers nothing. */
+export function isKnownColumn(columnId: string): boolean {
+  return columns.has(columnId) || columnDocs.has(columnId);
+}
+
+/**
+ * The ordering doc for a column that exists, or undefined for an id the server
+ * has never heard of — in which case nothing is registered. A column that
+ * exists but has no doc yet (one made by CREATE, not seeded) gets its first one
+ * here.
+ */
+export function columnDocFor(columnId: string): Y.Doc | undefined {
+  return isKnownColumn(columnId) ? getColumnDoc(columnId) : undefined;
 }
 
 /** Persists a column's full Yjs state — call after any update is applied to its doc. */

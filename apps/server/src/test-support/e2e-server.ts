@@ -95,11 +95,11 @@ interface Running {
   kill(): Promise<void>;
 }
 
-async function spawnServer(databaseUrl: string): Promise<Running> {
+async function spawnServer(databaseUrl: string, extraEnv: Record<string, string>): Promise<Running> {
   const port = await freePort();
   const child: ChildProcess = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: serverDir,
-    env: { ...process.env, DATABASE_URL: databaseUrl, PORT: String(port) },
+    env: { ...process.env, ...extraEnv, DATABASE_URL: databaseUrl, PORT: String(port) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let log = "";
@@ -143,9 +143,11 @@ ${log}`));
   };
 }
 
-export async function startE2eServer(): Promise<E2eServer> {
+/** `env` adds environment variables to the server process, e.g. smaller WS_* limits so a test can reach them cheaply. */
+export async function startE2eServer(options: { env?: Record<string, string> } = {}): Promise<E2eServer> {
+  const extraEnv = options.env ?? {};
   const database = await createDatabase();
-  let running = await spawnServer(database.url);
+  let running = await spawnServer(database.url, extraEnv);
   return {
     get url() {
       return running.url;
@@ -158,7 +160,7 @@ export async function startE2eServer(): Promise<E2eServer> {
     output: () => running.output(),
     async restart() {
       await running.kill();
-      running = await spawnServer(database.url);
+      running = await spawnServer(database.url, extraEnv);
     },
     async stop() {
       await running.kill();
@@ -192,9 +194,24 @@ export async function waitForRow(databaseUrl: string, id: string, ready: (row: C
 /** A bare protocol-level client: records everything the server sends it, in order. */
 export class Peer {
   readonly received: ServerMessage[] = [];
+  /** The close code once the server (or this peer) has closed the socket. */
+  closeCode: number | undefined;
 
   private constructor(private readonly socket: WebSocket) {
     socket.on("message", (raw) => this.received.push(JSON.parse(raw.toString()) as ServerMessage));
+    socket.on("close", (code) => {
+      this.closeCode = code;
+    });
+  }
+
+  /** Resolves with the close code once the socket has closed. */
+  async waitForClose(timeoutMs = 5000): Promise<number> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.closeCode === undefined) {
+      if (Date.now() > deadline) throw new Error("timed out waiting for the socket to close");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return this.closeCode;
   }
 
   static async connect(url: string): Promise<Peer> {

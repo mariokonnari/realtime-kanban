@@ -1,13 +1,14 @@
 import { WebSocketServer, WebSocket } from "ws";
 import * as Y from "yjs";
 import type { ClientMessage, Presence, ServerMessage, SyncResponseMessage } from "@realtime-kanban/shared-types";
-import { decodeUpdate } from "@realtime-kanban/shared-types";
+import { LIMITS, decodeUpdate, parseClientMessage } from "@realtime-kanban/shared-types";
 import {
   applyMutation,
   applyDelete,
   isTombstoned,
   createEntity,
-  getColumnDoc,
+  columnDocFor,
+  isKnownColumn,
   persistColumnDoc,
   flushWrites,
   getFullState,
@@ -16,6 +17,7 @@ import {
   cards,
 } from "./store.js";
 import { assertServerDatabaseHost } from "./db-guard.js";
+import { FrameQueue, RejectedIds, ViolationTracker, loadLimits } from "./connection-limits.js";
 
 const PORT = Number(process.env.PORT ?? 4001);
 
@@ -54,8 +56,13 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? "")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+const limits = loadLimits(process.env);
+
 const wss = new WebSocketServer({
   port: PORT,
+  // A frame over this is refused by ws itself, which closes the socket with
+  // 1009 before the frame is buffered or parsed.
+  maxPayload: limits.maxPayload,
   verifyClient:
     allowedOrigins.length > 0
       ? (info: { origin: string }) => allowedOrigins.includes(info.origin)
@@ -143,7 +150,10 @@ function handleMessage(socket: WebSocket, message: ClientMessage) {
     }
 
     case "CRDT_UPDATE": {
-      const doc = getColumnDoc(message.columnId);
+      // checkAgainstState() has already refused an unknown column, so this only
+      // creates a doc for a column that exists.
+      const doc = columnDocFor(message.columnId);
+      if (!doc) throw new Error(`no such column ${message.columnId}`);
       Y.applyUpdate(doc, decodeUpdate(message.update));
       persistColumnDoc(message.columnId);
       broadcast(message, socket); // relay the same base64 string, no re-encoding needed
@@ -163,9 +173,16 @@ function handleMessage(socket: WebSocket, message: ClientMessage) {
   }
 }
 
+// The id an ACK for this frame would carry. Only a sane one: an id past the cap
+// (or not a string) can't have come from a conforming client, and echoing it
+// back would just bounce an attacker's bytes at them.
 function messageIdOf(parsed: unknown): string | undefined {
   const id = (parsed as { messageId?: unknown } | null)?.messageId;
-  return typeof id === "string" && id.length > 0 ? id : undefined;
+  return typeof id === "string" && id.length > 0 && id.length <= LIMITS.messageId ? id : undefined;
+}
+
+function afterWrites(fn: () => void) {
+  void flushWrites().then(fn);
 }
 
 // Tells the sending socket its message has been dealt with, so the client can
@@ -174,51 +191,160 @@ function messageIdOf(parsed: unknown): string | undefined {
 // an ACK means "applied and persisted", not just "applied in memory", so a
 // server crash before the write leaves the message un-ACKed and it replays.
 function ack(socket: WebSocket, messageId: string, error?: string) {
-  void flushWrites().then(() => {
+  afterWrites(() => {
     if (socket.readyState === WebSocket.OPEN) {
       send(socket, { type: "ACK", messageId, ...(error ? { error } : {}) } satisfies ServerMessage);
     }
   });
 }
 
-// A frame that isn't JSON, or isn't an object with a string `type`, is logged
-// and dropped. Nothing may throw out of a socket "message" listener: an
-// uncaught exception there terminates the whole process, taking every
-// client's connection with it. If the dropped message carried a messageId it
-// is ACKed with an error, so the client discards it instead of replaying a
-// message that can never succeed.
-function onFrame(socket: WebSocket, raw: WebSocket.RawData) {
+// Checks that need the server's state, run after the schema and before the
+// handler touches anything. Returns why the message can't be accepted, if so.
+// Nothing here registers or changes state.
+function checkAgainstState(message: ClientMessage): string | undefined {
+  if (message.type !== "CRDT_UPDATE") return undefined;
+  if (!isKnownColumn(message.columnId)) return "unknown column";
+  try {
+    Y.decodeUpdate(decodeUpdate(message.update)); // parses the structs without applying them
+  } catch {
+    return "not a Yjs update";
+  }
+  return undefined;
+}
+
+let nextConnectionId = 1;
+
+interface Connection {
+  readonly id: number;
+  readonly address: string;
+  readonly socket: WebSocket;
+  readonly violations: ViolationTracker;
+  readonly queue: FrameQueue<WebSocket.RawData>;
+  // Set once the server has decided to close this socket: later frames are
+  // ignored (they were never ACKed, so a conforming client replays them).
+  closing: boolean;
+}
+
+// Server-wide, so a replay on a new connection is recognised. See RejectedIds.
+const rejectedIds = new RejectedIds();
+
+function closeConnection(conn: Connection, code: number, reason: string) {
+  if (conn.closing) return;
+  conn.closing = true;
+  conn.queue.stop();
+  // After the ACKs already queued, so an entry rejected with an error is told
+  // so before the socket goes: otherwise it would replay on the next
+  // connection, be rejected again and eventually close that one too.
+  afterWrites(() => conn.socket.close(code, reason));
+}
+
+// The one path for a message the server refuses: invalid, or it threw. A frame
+// with a messageId is ACKed with an error and the client drops the entry; one
+// without can't be, and is only logged. Either way it counts as a violation
+// of this connection, and repeated violations close it.
+function reject(conn: Connection, messageId: string | undefined, type: string, error: string) {
+  // The same entry replayed after the connection that rejected it died, because
+  // its error ACK never arrived, isn't a new offence by this client.
+  const forgiven = messageId !== undefined && rejectedIds.forgive(messageId, conn.id);
+  const count = forgiven ? 0 : conn.violations.record();
+  console.warn(
+    `[violation] conn=${conn.id} ${conn.address} ${type}: ${error}` +
+      (forgiven ? " (replay of an already-rejected message, not counted)" : ` (${count}/${limits.maxViolations})`),
+  );
+  if (messageId) ack(conn.socket, messageId, `invalid message: ${error}`.slice(0, 200));
+  if (!forgiven && conn.violations.isOver(count)) {
+    console.warn(`[violation] conn=${conn.id} ${conn.address} closing: ${count} violations within ${limits.violationWindowMs} ms`);
+    closeConnection(conn, 1008, "too many invalid messages");
+  }
+}
+
+// A frame that isn't JSON, fails the schema, or can't be handled is logged and
+// dropped. Nothing may throw out of a socket "message" listener: an uncaught
+// exception there terminates the whole process, taking every client's
+// connection with it. If the dropped message carried a messageId it is ACKed
+// with an error, so the client discards it instead of replaying a message that
+// can never succeed.
+//
+// Validation happens first and completely: the schema (shapes, caps, required
+// fields, unknown fields stripped), then checks against server state. Only a
+// message that passed both reaches handleMessage, so a handler never runs on
+// input it would have to defend itself against, and nothing is registered or
+// mutated on behalf of a message that is then refused.
+function processFrame(conn: Connection, raw: WebSocket.RawData) {
+  if (conn.closing) return;
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw.toString());
-  } catch (error) {
-    console.error("Dropping malformed frame:", error instanceof Error ? error.message : error);
-    return; // not JSON: there is no messageId to ACK
+  } catch {
+    reject(conn, undefined, "frame", "not JSON"); // no messageId to ACK
+    return;
   }
   const messageId = messageIdOf(parsed);
-  if (typeof parsed !== "object" || parsed === null || typeof (parsed as { type?: unknown }).type !== "string") {
-    console.error("Dropping frame: not a message object with a string type");
-    if (messageId) ack(socket, messageId, "invalid message");
+  const result = parseClientMessage(parsed);
+  if (!result.ok) {
+    reject(conn, messageId, "frame", result.error);
     return;
   }
-  const message = parsed as ClientMessage;
+  const message = result.message;
+  const problem = checkAgainstState(message);
+  if (problem) {
+    reject(conn, messageId, message.type, problem);
+    return;
+  }
   try {
-    handleMessage(socket, message);
+    handleMessage(conn.socket, message);
   } catch (error) {
-    // e.g. a CRDT_UPDATE whose payload isn't a valid Yjs update.
+    // Not expected now that the message is validated; kept so one bad message
+    // can never take the process down.
     console.error(`Dropping ${message.type} message that failed to handle:`, error);
-    if (messageId) ack(socket, messageId, "failed to handle message");
+    reject(conn, messageId, message.type, "failed to handle message");
     return;
   }
-  if (messageId) ack(socket, messageId);
+  if (messageId) ack(conn.socket, messageId);
 }
 
-wss.on("connection", (socket) => {
+function frameBytes(raw: WebSocket.RawData): number {
+  return Array.isArray(raw) ? raw.reduce((sum, chunk) => sum + chunk.byteLength, 0) : raw.byteLength;
+}
+
+wss.on("connection", (socket, request) => {
   clients.add(socket);
 
-  socket.on("message", (raw) => onFrame(socket, raw));
+  const conn: Connection = {
+    id: nextConnectionId++,
+    address: request.socket.remoteAddress ?? "unknown",
+    socket,
+    violations: new ViolationTracker(limits.maxViolations, limits.violationWindowMs),
+    closing: false,
+    queue: new FrameQueue<WebSocket.RawData>(limits, {
+      handle: (raw) => processFrame(conn, raw),
+      onDelayStart: () =>
+        console.warn(
+          `[rate limit] conn=${conn.id} ${conn.address} past its burst of ${limits.burst}: delaying messages, in order`,
+        ),
+      onOverflow: () => {
+        console.warn(
+          `[rate limit] conn=${conn.id} ${conn.address} backlog over ${limits.maxBacklog} messages: closing; unACKed messages replay on reconnect`,
+        );
+        closeConnection(conn, 1013, "too many queued messages");
+      },
+    }),
+  };
+
+  // Without a listener an 'error' event is an uncaught exception, which ends
+  // the process. ws emits one for a frame over maxPayload (RangeError, then it
+  // closes the socket with 1009) and for protocol errors — all of which a
+  // client can cause at will.
+  socket.on("error", (error) => {
+    console.warn(`[connection] conn=${conn.id} ${conn.address} socket error: ${error.message}`);
+  });
+
+  // Every frame goes through the queue, which hands it straight to processFrame
+  // unless this connection is over its rate.
+  socket.on("message", (raw) => conn.queue.push(raw, frameBytes(raw)));
 
   socket.on("close", () => {
+    conn.queue.stop();
     clients.delete(socket);
     const presence = presenceBySocket.get(socket);
     presenceBySocket.delete(socket);
