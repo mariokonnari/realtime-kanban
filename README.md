@@ -179,6 +179,73 @@ but have no end-to-end test), network partitions, or CRDT card ordering
 end to end (the Yjs guarantee itself is tested at the library level in
 `concurrency.test.ts`).
 
+## Property and browser tests
+
+**Property tests** (`apps/web/lib/*.property.test.ts`, fast-check) generate
+many random scenarios and check an invariant on each, instead of a few
+hand-picked ones.
+
+- `lww-convergence.property.test.ts` — random `MUTATE`s (fields, lamports,
+  client ids, with ties common) delivered to two server replicas (the real
+  `applyMutation`, Prisma stubbed) and two client replicas (the real
+  `FieldClocks`) in random orders with duplicates. All end identical, and
+  identical to the highest-clock write per field — checked against a
+  comparator written separately from `isNewer`, because agreement alone is
+  satisfied by a consistently *wrong* rule (flipping `isNewer` to prefer the
+  lower clock keeps every replica in agreement; only the winner check
+  fails). The DB stub shows the server's queued writes end on the same
+  winner. Not covered: the network, real persistence, tombstones (the
+  server drops edits to a deleted card above `applyMutation`), the rest of
+  the client (SYNC resets, the reducer), and equal clocks with different
+  values (no real sender produces them).
+- `yjs-ordering.property.test.ts` — random creates and moves, using the
+  Yjs steps `createCard`/`moveCard` perform (copied: they live inside a
+  React hook), made concurrently by 2–3 replicas and merged in random
+  orders, with and without per-sender ordering, plus a server doc and a late
+  joiner. All converge, no card is lost, and when each card is moved by one
+  replica only every card appears exactly once. Not covered: the network,
+  Postgres, tombstones, and whether the resulting order is what a user meant.
+
+**Browser tests** (`apps/e2e`, Playwright, Chromium) run against localhost
+only: the web app is built with `NEXT_PUBLIC_WS_URL` pointing at the test
+server (Next inlines it at build time), `next start` serves it, and each
+test starts the real server process on a throwaway `kanban_e2e_*` database
+at a fixed port (default 4101; the web app on 3101; `E2E_WS_PORT` /
+`E2E_WEB_PORT` change them). A page's http(s) request to any host but
+loopback is blocked, and that (or a WebSocket to one) fails the test; the
+harness refuses `APP_ENV=production`, a non-local `DATABASE_URL`, or a port
+that already has a listener. (The build itself fetches the Google fonts
+`layout.tsx` asks for, as any `next build` does.) `npm run test:e2e
+--workspace=apps/e2e`; the build writes `apps/web/.next`.
+
+- `concurrent-edit.spec.ts` — two contexts edit one card's title while
+  each page's incoming `MUTATE`s are held, so the edits are concurrent by
+  construction; the edit that arrives last at the server has the lower
+  clock. Both screens and Postgres end on the higher-clock title. Only
+  the title, two browsers, no ties, no deletes.
+- `offline-queue.spec.ts` — two pages of one context (real IndexedDB, real
+  Web Locks) queue six entries while the server process is stopped; it is
+  restarted; every `messageId` is sent exactly once across both pages
+  (counted from the frames), the outbox ends empty, and both screens and
+  Postgres hold the same board with the LWW winner of a rename both made.
+  Without `navigator.locks` every entry goes out twice, so the count is
+  not vacuous. Not covered: a tab dying or the server dying mid-drain, more
+  than two pages, queued deletes, reloads.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push and pull request, on Node 24
+(the major version used locally; one `NODE_VERSION` at the top). The
+`checks` job: `npm ci`, `build:shared-types`, `prisma generate`, `tsc` for
+`apps/server` and `apps/web`, `typecheck:tests`, the browser tests' own
+typecheck, `prisma migrate deploy` against a Postgres 16 service container,
+then both test suites. The `browser` job installs Chromium and runs
+Playwright. Only `checks` sets `REQUIRE_DB=1` (it is set nowhere else), so
+there the seed-order and e2e suites fail instead of skipping when no
+localhost database is configured. The database credentials in the file are
+for the job's throwaway container; there are no secrets, and `APP_ENV` is
+never set.
+
 ## Input validation and limits
 
 Every frame the server reads goes through four steps, in this order, before
@@ -446,7 +513,19 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
   path is off while any entry awaits an ACK), so the queue grows and is
   replayed in full on reconnect or reload, and another tab can't drain.
   The fix would be a heartbeat that closes a socket after N seconds of
-  silence, letting the normal reconnect and replay run.
+  silence, letting the normal reconnect and replay run. The same gap is
+  why the browser tests don't use Playwright's `context.setOffline(true)`:
+  in Chromium it leaves an already-open WebSocket open (the top bar still
+  said "live" after 6 s), drops what is sent on it and never delivers what
+  the server sends, so the offline queue is never exercised.
+- **Two clients moving the same card at the same time leave it twice.**
+  `moveCard()` is a delete followed by an insert, not a Yjs move. Both
+  clients delete the one old entry and each inserts its own, so every
+  replica converges to a column (or two) listing the card twice, and
+  `ColumnView` maps each entry to a row (read from the code, not tried in
+  a browser). Found by
+  `yjs-ordering.property.test.ts`, which pins the behaviour down in its
+  last test; not fixed.
 - **Validation checks shapes and sizes, not meaning.** See "Input
   validation and limits". Still open: a `CREATE` for a card in a column
   that doesn't exist is accepted in memory (and its DB write then fails the
@@ -456,10 +535,12 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
   how many entities a client may create. The limiter is per connection, so
   reconnecting resets it — there is no per-IP limit. A `SYNC_REQUEST` costs
   one token like any frame although it serialises the whole board.
-- **The queue's browser-level paths are only tested against fakes.**
+- **The queue's browser-level paths are mostly tested against fakes.**
   Two-tab draining is tested against a stand-in for `navigator.locks`
-  (and `fake-indexeddb`), not a real browser; a tab closing mid-drain is
-  tested as its socket closing. Without IndexedDB (some private-browsing
+  (and `fake-indexeddb`); one real-browser case exists (two pages, one
+  context, a server restart — see "Property and browser tests"). A tab
+  closing mid-drain is tested only as its socket closing, and a server
+  that dies mid-drain not at all in a browser. Without IndexedDB (some private-browsing
   modes block it entirely) the queue degrades to in-memory only for that
   session: queued edits still replay, but won't survive a reload.
 - **Test coverage is mostly unit-level plus a few end-to-end suites.**
@@ -478,14 +559,20 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
   seeded server-side. Column order is a plain field (not a CRDT) and
   the UI only ever renders the first board, so nothing needed to
   create, rename, or reorder them yet.
-- **Database-backed tests skip silently without local Postgres.**
-  `seed-order.test.ts` and every `*.e2e.test.*` file talk to a real
-  database and only run when `DATABASE_URL` (or `apps/server/.env`)
-  points at localhost (the same guard the seed script uses, so tests can
-  never touch a remote DB). The e2e suites never touch your dev data:
-  each server they start gets its own throwaway `kanban_e2e_*` database,
-  dropped afterwards. With no local Postgres running they're skipped, not
-  failed, so a green run doesn't prove they passed.
+- **Database-backed tests skip silently when `DATABASE_URL` isn't a
+  localhost database** (unset, or a remote host). `seed-order.test.ts` and
+  every `*.e2e.test.*` file talk to a real database and only run when
+  `DATABASE_URL` (or `apps/server/.env`, for the e2e ones) points at
+  localhost (the same guard the seed script uses, so tests can never touch
+  a remote DB). Skipped, not failed, so a green run doesn't prove they
+  passed — unless `REQUIRE_DB=1` is set, which turns that skip into a
+  failure (CI sets it, see "CI"). A localhost `DATABASE_URL` with nothing
+  listening already fails on its own, with or without it. The e2e suites
+  never touch your dev data: each server they start gets its own throwaway
+  `kanban_e2e_*` database, dropped afterwards. **`seed-order.test.ts` is
+  the exception:** it runs in whatever `DATABASE_URL` names, clears its
+  boards and field clocks and reseeds the demo board afterwards, so don't
+  export your dev database's URL when you run it; point it at a scratch one.
 - **A process that loses the board-seeding race can serve an empty
   board.** The advisory lock in `board-seed-lock.ts` guarantees exactly
   one board is created even when several server instances start at
