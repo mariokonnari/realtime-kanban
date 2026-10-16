@@ -42,6 +42,30 @@ export function boardSnapshot(page: Page): Promise<Record<string, string[]>> {
   });
 }
 
+/**
+ * Drags a card the way a person does (native HTML5 drag and drop). Dropping on another
+ * card puts it at that card's position; dropping on a column's heading puts it at the
+ * end of that column. `onto` names a card by its title, or a column by "column:<title>".
+ */
+export async function dragCard(page: Page, title: string, onto: string) {
+  const target = onto.startsWith("column:")
+    ? page.getByRole("heading", { level: 2, name: onto.slice("column:".length), exact: true })
+    : cardTitle(page, onto);
+  await cardTitle(page, title).dragTo(target);
+}
+
+/** The snapshot once it has stopped changing (two identical reads 400 ms apart). */
+export async function settledSnapshot(page: Page): Promise<Record<string, string[]>> {
+  let previous = JSON.stringify(await boardSnapshot(page));
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(400);
+    const next = JSON.stringify(await boardSnapshot(page));
+    if (next === previous) return JSON.parse(next) as Record<string, string[]>;
+    previous = next;
+  }
+  throw new Error("the board never stopped changing");
+}
+
 /** What the browser has queued in IndexedDB (the offline outbox), oldest first. */
 export function readOutbox(page: Page): Promise<SentFrame[]> {
   return page.evaluate(

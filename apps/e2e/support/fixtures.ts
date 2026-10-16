@@ -17,17 +17,24 @@ export interface Tab {
 }
 
 /**
- * Holds the server's MUTATE broadcasts on their way to one page, so that two pages
- * can both edit a card before either has heard of the other's edit — a concurrent
- * edit by construction, not by luck of timing. Everything else, and everything the
- * page sends, passes straight through.
+ * Holds the server's broadcasts of certain types (MUTATE unless told otherwise) on
+ * their way to one page, so that two pages can both edit a card before either has
+ * heard of the other's edit — a concurrent edit by construction, not by luck of
+ * timing. Everything else, and everything the page sends, passes straight through.
  */
 export class MutationGate {
   private holding = false;
-  private held: { route: WebSocketRoute; message: string | Buffer }[] = [];
+  private held: { route: WebSocketRoute; message: string | Buffer; type: string }[] = [];
+
+  constructor(private readonly types: readonly string[] = ["MUTATE"]) {}
 
   get heldCount() {
     return this.held.length;
+  }
+
+  /** How many held frames are of this type. */
+  heldOf(type: string) {
+    return this.held.filter((h) => h.type === type).length;
   }
 
   hold() {
@@ -46,8 +53,9 @@ export class MutationGate {
       route.onMessage((message) => server.send(message));
       route.onClose((code, reason) => void server.close({ code, reason }));
       server.onMessage((message) => {
-        if (this.holding && typeof message === "string" && (JSON.parse(message) as { type?: string }).type === "MUTATE") {
-          this.held.push({ route, message });
+        const type = typeof message === "string" ? (JSON.parse(message) as { type?: string }).type : undefined;
+        if (this.holding && type !== undefined && this.types.includes(type)) {
+          this.held.push({ route, message, type });
         } else {
           route.send(message);
         }

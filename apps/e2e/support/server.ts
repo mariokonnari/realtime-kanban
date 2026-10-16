@@ -6,6 +6,7 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PrismaClient } from "@prisma/client";
+import * as Y from "yjs";
 import { WS_PORT, WS_URL, isLoopbackHost } from "./env";
 
 // The real server process (apps/server/src/index.ts) on a throwaway database, for
@@ -163,6 +164,34 @@ export class TestServer {
         where: { deletedAt: null },
         select: { id: true, title: true, columnId: true },
       });
+    } finally {
+      await db.$disconnect();
+    }
+  }
+
+  /**
+   * The board as Postgres holds it: every non-deleted card (with its columnId), and each
+   * column's card order decoded from the persisted Yjs state in `column_docs`.
+   */
+  async board(): Promise<{
+    columns: { id: string; title: string }[];
+    cards: { id: string; title: string; columnId: string }[];
+    orders: Record<string, string[]>;
+  }> {
+    const db = new PrismaClient({ datasourceUrl: this.databaseUrl });
+    try {
+      const [columns, cards, docs] = await Promise.all([
+        db.column.findMany({ select: { id: true, title: true }, orderBy: { order: "asc" } }),
+        db.card.findMany({ where: { deletedAt: null }, select: { id: true, title: true, columnId: true } }),
+        db.columnDoc.findMany(),
+      ]);
+      const orders: Record<string, string[]> = {};
+      for (const { columnId, state } of docs) {
+        const doc = new Y.Doc();
+        Y.applyUpdate(doc, state);
+        orders[columnId] = doc.getArray<string>("cardOrder").toArray();
+      }
+      return { columns, cards, orders };
     } finally {
       await db.$disconnect();
     }
