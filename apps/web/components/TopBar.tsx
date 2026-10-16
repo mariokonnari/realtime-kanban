@@ -14,7 +14,7 @@ export function TopBar() {
   // "Offline" only once a connection has actually dropped/failed (or queued
   // work is waiting) — not during the first moments after page load.
   const offline = !connected && (interrupted || pending > 0);
-  // Reconnected, but the queue hasn't finished draining yet.
+  // Connected, but some changes are still queued or sent without a confirmation (ACK) back yet.
   const syncing = connected && pending > 0;
 
   return (
@@ -52,7 +52,7 @@ export function TopBar() {
             title={
               offline
                 ? `Not connected — ${pending} change${pending === 1 ? "" : "s"} saved on this device, will sync on reconnect`
-                : `Reconnected — sending ${pending} saved change${pending === 1 ? "" : "s"}`
+                : `Connected — ${pending} change${pending === 1 ? "" : "s"} saved on this device, waiting for the server to confirm`
             }
           >
             <span className="inline-flex h-2 w-2 rounded-full bg-accent-pink" />

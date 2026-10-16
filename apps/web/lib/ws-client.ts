@@ -1,6 +1,6 @@
 "use client";
 
-import type { ClientMessage, ServerMessage, LamportClock } from "@realtime-kanban/shared-types";
+import type { AckMessage, ClientMessage, ServerMessage, LamportClock } from "@realtime-kanban/shared-types";
 import { OfflineQueue, isDurable, type DurableMessage, type QueueEntry } from "./offline-queue";
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:4001";
@@ -73,10 +73,16 @@ interface OutboxEntry {
   message: DurableMessage;
   key?: number | null;
   written: Promise<void>; // settles (never rejects) once `key` is known
+  // The socket this entry was sent on and has not been ACKed on yet. An entry
+  // leaves the outbox (and IndexedDB) when the server ACKs its messageId, not
+  // when it is sent; if the socket closes first this is cleared and the entry
+  // is sent again on the next one, with the same messageId.
+  awaitingAck?: WebSocket;
 }
 
-// Held while draining so two tabs sharing one IndexedDB never replay the same
-// entry twice — the server's CREATE is not idempotent.
+// Held for the whole of a drain — until every entry that drain sent has been
+// ACKed or the socket has closed — so two tabs sharing one IndexedDB never
+// send the same entry at once. See flush().
 const DRAIN_LOCK = "realtime-kanban-offline-drain";
 
 export class WsClient {
@@ -99,6 +105,13 @@ export class WsClient {
   // request. The server handles a socket's messages in order, so its
   // SYNC_RESPONSE cannot include them — see takeUnsynced().
   private sentSince: DurableMessage[][] = [];
+  // Resolvers for flush() while it waits on ACKs: woken by an ACK, a close, or a new entry.
+  private progressWaiters: Array<() => void> = [];
+  // Whether the server on the CURRENT socket ACKs messages. Assumed true until
+  // that socket's first SYNC_RESPONSE says otherwise; decided once per socket
+  // (later responses never flip it) and reset whenever a socket opens or closes.
+  private serverAcks = true;
+  private acksDecided = false;
 
   constructor(private readonly queue = new OfflineQueue()) {}
 
@@ -121,6 +134,7 @@ export class WsClient {
       this.connected = true;
       this.interrupted = false;
       this.sentSince = [];
+      this.resetAckSupport();
       // Sync first, so local Yjs docs merge the server's current state
       // before pending local ops replay on top of it.
       this.requestSync();
@@ -135,6 +149,13 @@ export class WsClient {
 
     socket.addEventListener("message", (event) => {
       const message = JSON.parse(event.data) as ServerMessage;
+      if (message.type === "ACK") {
+        this.handleAck(message); // transport bookkeeping, not board state: listeners never see it
+        return;
+      }
+      // Decided before any listener runs, so takeUnsynced() (called from the
+      // SYNC_RESPONSE listener) already sees the entries this may discard.
+      if (message.type === "SYNC_RESPONSE") this.decideAckSupport(message.acks === true);
       // Any clock we see, ours must end up above: otherwise an edit made
       // after seeing someone else's would stamp a lower clock and lose to it.
       observeServerClocks(message);
@@ -146,6 +167,9 @@ export class WsClient {
       this.connected = false;
       this.interrupted = true;
       this.sentSince = []; // responses to this socket's requests will never arrive
+      for (const entry of this.outbox) entry.awaitingAck = undefined; // unACKed: replay on the next socket
+      this.resetAckSupport();
+      this.notifyProgress();
       this.publish();
       // Naive fixed-delay reconnect, no exponential backoff yet —
       // acceptable for a demo, a real gap for production.
@@ -195,10 +219,14 @@ export class WsClient {
   }
 
   private enqueue(message: DurableMessage) {
-    const entry: OutboxEntry = { message, written: Promise.resolve() };
+    // The id is made once, here, and stored with the entry: a replay after a
+    // reconnect or a reload reuses it, which is what lets the server tell a
+    // replay from a new message.
+    const queued: DurableMessage = message.messageId ? message : { ...message, messageId: crypto.randomUUID() };
+    const entry: OutboxEntry = { message: queued, written: Promise.resolve() };
     // Wait for the initial read so this write can't also show up in it.
     entry.written = this.loadPending()
-      .then(() => this.queue.add(message))
+      .then(() => this.queue.add(queued))
       .then(
         (key) => {
           entry.key = key;
@@ -209,6 +237,7 @@ export class WsClient {
       );
     this.outbox.push(entry);
     this.publish();
+    this.notifyProgress();
   }
 
   private loadPending(): Promise<void> {
@@ -256,23 +285,107 @@ export class WsClient {
     else await fn();
   }
 
+  /**
+   * Sends every entry not yet sent on this socket, then holds the drain lock
+   * until all of them are ACKed (or the socket closes).
+   *
+   * Why hold the lock rather than mark entries "in flight" in IndexedDB: the
+   * lock is released by the browser the moment this tab dies, so a crashed or
+   * closed tab can never leave an entry stuck as "somebody else's"; a marker
+   * would need a lease and a clock to expire it. The cost is that another tab
+   * can't drain while this one waits on ACKs — normally one round trip.
+   * If this socket closes with entries unACKed, the lock is released and
+   * whichever tab drains next (re)sends them; the server's handlers are
+   * idempotent, so that is safe.
+   */
   private async flush() {
     await this.reconcile();
-    let replayed = 0;
-    while (this.isOpen()) {
-      const entry = this.outbox[0];
-      if (!entry) break;
-      await entry.written;
-      if (!this.isOpen() || !this.rawSend(entry.message)) break;
-      this.noteSent(entry.message);
-      this.outbox = this.outbox.filter((e) => e !== entry);
-      replayed += 1;
-      this.publish();
-      if (typeof entry.key === "number") await this.queue.remove(entry.key).catch(() => {});
+    let sent = 0;
+    for (;;) {
+      for (const entry of [...this.outbox]) {
+        if (!this.isOpen()) break;
+        if (this.isAwaiting(entry)) continue;
+        await entry.written;
+        if (!this.isOpen() || !this.rawSend(entry.message)) break;
+        this.noteSent(entry.message);
+        sent += 1;
+        if (entry.message.messageId === undefined || !this.serverAcks) {
+          // No ACK will ever come — the entry was written by an older client,
+          // or this socket's server doesn't ACK — so keep the old behavior and
+          // drop it as soon as it is sent.
+          this.outbox = this.outbox.filter((e) => e !== entry);
+          this.publish();
+          if (typeof entry.key === "number") await this.queue.remove(entry.key).catch(() => {});
+        } else {
+          entry.awaitingAck = this.socket ?? undefined;
+        }
+      }
+      if (!this.isOpen() || !this.outbox.some((e) => this.isAwaiting(e))) break;
+      await this.progress();
     }
-    // Replayed edits can lose to newer ones; the server never tells the loser.
-    // One more sync hands back the authoritative result of the whole replay.
-    if (replayed > 0 && this.isOpen()) this.requestSync();
+    // Replayed edits can lose to newer ones. One more sync hands back the
+    // authoritative result of the whole replay (it runs after the ACKs, so the
+    // server has handled everything it covers).
+    if (sent > 0 && this.isOpen()) this.requestSync();
+  }
+
+  private isAwaiting(entry: OutboxEntry) {
+    return entry.awaitingAck !== undefined && entry.awaitingAck === this.socket;
+  }
+
+  private progress(): Promise<void> {
+    return new Promise((resolve) => this.progressWaiters.push(resolve));
+  }
+
+  private notifyProgress() {
+    const waiters = this.progressWaiters;
+    this.progressWaiters = [];
+    waiters.forEach((resolve) => resolve());
+  }
+
+  // The server has dealt with this message (applied, rejected, or recognized
+  // it as a duplicate) — or, with `error`, can never accept it. Either way
+  // there is nothing left to replay.
+  private handleAck(ack: AckMessage) {
+    const entry = this.outbox.find((e) => e.message.messageId === ack.messageId);
+    if (!entry) return; // already gone: a repeated ACK
+    if (ack.error) console.error(`server refused queued ${entry.message.type} for good (${ack.error}); dropping it`);
+    this.discard([entry]);
+  }
+
+  private resetAckSupport() {
+    this.serverAcks = true;
+    this.acksDecided = false;
+  }
+
+  // Called with the first SYNC_RESPONSE on a socket. The server handles a
+  // socket's messages in order and answers SYNC_REQUEST synchronously, while
+  // an ACK always waits on at least a microtask, so the response is guaranteed
+  // to arrive before any ACK: if it carries no `acks` flag, this server will
+  // never ACK, and waiting for one would hold the drain lock and keep the
+  // entries "pending" forever.
+  private decideAckSupport(supported: boolean) {
+    if (this.acksDecided) return;
+    this.acksDecided = true;
+    if (supported) return;
+    this.serverAcks = false;
+    // What was already sent on this socket counts as delivered, like it did
+    // before ACKs existed. Discarding wakes flush(), which then releases the lock.
+    this.discard(this.outbox.filter((entry) => this.isAwaiting(entry)));
+  }
+
+  // Removes entries from the outbox and, once their write has landed, from IndexedDB.
+  private discard(entries: OutboxEntry[]) {
+    if (entries.length === 0) return;
+    this.outbox = this.outbox.filter((e) => !entries.includes(e));
+    this.publish();
+    this.notifyProgress();
+    // If a delete is lost (tab closes first) the entry just replays once more.
+    for (const entry of entries) {
+      void entry.written.then(() =>
+        typeof entry.key === "number" ? this.queue.remove(entry.key).catch(() => {}) : undefined,
+      );
+    }
   }
 
   // Re-reads the store (cursor, insertion order) under the drain lock: another
@@ -302,13 +415,17 @@ export class WsClient {
 
   /**
    * Durable messages the server's latest SYNC_RESPONSE does not reflect: those
-   * sent after the matching SYNC_REQUEST, plus those still queued. The caller
+   * sent after the matching SYNC_REQUEST, plus those still queued. (Entries
+   * sent earlier on this socket and awaiting their ACK are already in the
+   * response — the server handles a socket's messages in order — so they are
+   * not repeated here; re-applying a CREATE would clobber later edits.) The caller
    * re-applies them on top of the synced state so optimistic local edits
    * don't vanish on reconnect (the server never echoes a message to its sender).
    */
   takeUnsynced(): ClientMessage[] {
     const sent = this.sentSince.shift() ?? [];
-    return [...sent, ...this.outbox.map((entry) => entry.message)];
+    const queued = this.outbox.filter((entry) => !this.isAwaiting(entry)).map((entry) => entry.message);
+    return [...sent, ...queued];
   }
 
   private publish() {
