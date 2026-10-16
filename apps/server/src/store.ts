@@ -133,6 +133,9 @@ export function applyDelete(entityType: EntityType, entityId: string): boolean {
   const table = tableFor(entityType) as Map<string, Card | Column | Board>;
   const entity = table.get(entityId);
   if (!entity || !("deletedAt" in entity)) return false;
+  // Already tombstoned: a replayed or duplicate DELETE must change nothing —
+  // no new deletedAt, no DB write. The caller must not rebroadcast either.
+  if ((entity as Card).deletedAt != null) return false;
   const deletedAt = new Date().toISOString();
   (entity as Card).deletedAt = deletedAt;
 

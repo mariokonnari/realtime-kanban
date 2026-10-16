@@ -51,7 +51,16 @@ export interface Presence {
 
 // ---- Wire messages ----
 
-export interface MutateMessage {
+// Optional on every durable client message (the ones that change shared
+// state). A client generates it when it queues the message and keeps it for
+// every replay; the server answers a message that carries one with an
+// AckMessage once it has been handled. Messages without one are still
+// accepted and never ACKed.
+export interface Deliverable {
+  messageId?: string;
+}
+
+export interface MutateMessage extends Deliverable {
   type: "MUTATE";
   entityType: EntityType;
   entityId: string;
@@ -64,13 +73,13 @@ export interface MutateMessage {
   updatedAt?: string;
 }
 
-export interface CrdtUpdateMessage {
+export interface CrdtUpdateMessage extends Deliverable {
   type: "CRDT_UPDATE";
   columnId: string;
   update: string; // base64-encoded Yjs diff — see binary.ts for why
 }
 
-export interface CreateMessage {
+export interface CreateMessage extends Deliverable {
   type: "CREATE";
   entityType: EntityType;
   entityId: string;
@@ -78,7 +87,7 @@ export interface CreateMessage {
   clock: LamportClock;
 }
 
-export interface DeleteMessage {
+export interface DeleteMessage extends Deliverable {
   type: "DELETE";
   entityType: EntityType;
   entityId: string;
@@ -121,6 +130,21 @@ export interface SyncResponseMessage {
   // later remote writes against the same clocks the server uses. Additive:
   // optional because an older server doesn't send it.
   fieldClocks?: Record<string, LamportClock>;
+  // True on every SYNC_RESPONSE from a server that ACKs messages carrying a
+  // messageId. A client that sees a first SYNC_RESPONSE without it is talking
+  // to an older server that never will, and must not wait for ACKs from it.
+  acks?: boolean;
+}
+
+// Sent to the SENDING socket only, after the server has handled a message that
+// carried a messageId — applied, rejected as stale, or ignored as a duplicate
+// all count. `error` is set when the message was invalid or handling threw:
+// the server will never accept it, so the client should drop it rather than
+// replay it forever.
+export interface AckMessage {
+  type: "ACK";
+  messageId: string;
+  error?: string;
 }
 
 export type ClientMessage =
@@ -138,4 +162,5 @@ export type ServerMessage =
   | DeleteMessage
   | PresenceMessage
   | PresenceLeaveMessage
-  | SyncResponseMessage;
+  | SyncResponseMessage
+  | AckMessage;

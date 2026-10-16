@@ -167,6 +167,28 @@ export async function startE2eServer(): Promise<E2eServer> {
   };
 }
 
+/** The persisted Card row (or null), read straight from the server's database. */
+type CardRow = Awaited<ReturnType<typeof readCardRow>>;
+
+export async function readCardRow(databaseUrl: string, id: string) {
+  const db = new PrismaClient({ datasourceUrl: databaseUrl });
+  try {
+    return await db.card.findUnique({ where: { id } });
+  } finally {
+    await db.$disconnect();
+  }
+}
+
+export async function waitForRow(databaseUrl: string, id: string, ready: (row: CardRow) => boolean) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const row = await readCardRow(databaseUrl, id);
+    if (ready(row)) return row as NonNullable<CardRow>;
+    if (Date.now() > deadline) throw new Error("timed out waiting for the write to reach Postgres");
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 /** A bare protocol-level client: records everything the server sends it, in order. */
 export class Peer {
   readonly received: ServerMessage[] = [];

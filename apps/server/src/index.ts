@@ -9,6 +9,7 @@ import {
   createEntity,
   getColumnDoc,
   persistColumnDoc,
+  flushWrites,
   getFullState,
   initStore,
   seedDemoBoard,
@@ -68,7 +69,10 @@ const clients = new Set<WebSocket>();
 const presenceBySocket = new Map<WebSocket, Presence>();
 
 function broadcast(message: unknown, exclude?: WebSocket) {
-  const payload = JSON.stringify(message);
+  // A messageId is between the sender and the server (see ACK below); other
+  // clients have no use for it.
+  const { messageId: _omitted, ...relayed } = message as { messageId?: string };
+  const payload = JSON.stringify(relayed);
   for (const client of clients) {
     if (client !== exclude && client.readyState === WebSocket.OPEN) {
       client.send(payload);
@@ -88,6 +92,7 @@ function handleMessage(socket: WebSocket, message: ClientMessage) {
         type: "SYNC_RESPONSE",
         ...state,
         presence: [...presenceBySocket.values()],
+        acks: true,
       };
       send(socket, response);
       break;
@@ -131,8 +136,9 @@ function handleMessage(socket: WebSocket, message: ClientMessage) {
     }
 
     case "DELETE": {
-      applyDelete(message.entityType, message.entityId);
-      broadcast(message, socket);
+      // Only the delete that actually tombstones something is relayed; a
+      // replay of one that already happened is ignored.
+      if (applyDelete(message.entityType, message.entityId)) broadcast(message, socket);
       break;
     }
 
@@ -157,36 +163,60 @@ function handleMessage(socket: WebSocket, message: ClientMessage) {
   }
 }
 
+function messageIdOf(parsed: unknown): string | undefined {
+  const id = (parsed as { messageId?: unknown } | null)?.messageId;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+// Tells the sending socket its message has been dealt with, so the client can
+// stop holding it for replay. Sent once the DB writes queued so far have
+// settled (flushWrites never rejects; a failed write is logged, see store.ts):
+// an ACK means "applied and persisted", not just "applied in memory", so a
+// server crash before the write leaves the message un-ACKed and it replays.
+function ack(socket: WebSocket, messageId: string, error?: string) {
+  void flushWrites().then(() => {
+    if (socket.readyState === WebSocket.OPEN) {
+      send(socket, { type: "ACK", messageId, ...(error ? { error } : {}) } satisfies ServerMessage);
+    }
+  });
+}
+
 // A frame that isn't JSON, or isn't an object with a string `type`, is logged
 // and dropped. Nothing may throw out of a socket "message" listener: an
 // uncaught exception there terminates the whole process, taking every
-// client's connection with it.
-function parseFrame(raw: WebSocket.RawData): ClientMessage | null {
+// client's connection with it. If the dropped message carried a messageId it
+// is ACKed with an error, so the client discards it instead of replaying a
+// message that can never succeed.
+function onFrame(socket: WebSocket, raw: WebSocket.RawData) {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw.toString());
-    if (typeof parsed === "object" && parsed !== null && typeof (parsed as { type?: unknown }).type === "string") {
-      return parsed as ClientMessage;
-    }
-    console.error("Dropping frame: not a message object with a string type");
+    parsed = JSON.parse(raw.toString());
   } catch (error) {
     console.error("Dropping malformed frame:", error instanceof Error ? error.message : error);
+    return; // not JSON: there is no messageId to ACK
   }
-  return null;
+  const messageId = messageIdOf(parsed);
+  if (typeof parsed !== "object" || parsed === null || typeof (parsed as { type?: unknown }).type !== "string") {
+    console.error("Dropping frame: not a message object with a string type");
+    if (messageId) ack(socket, messageId, "invalid message");
+    return;
+  }
+  const message = parsed as ClientMessage;
+  try {
+    handleMessage(socket, message);
+  } catch (error) {
+    // e.g. a CRDT_UPDATE whose payload isn't a valid Yjs update.
+    console.error(`Dropping ${message.type} message that failed to handle:`, error);
+    if (messageId) ack(socket, messageId, "failed to handle message");
+    return;
+  }
+  if (messageId) ack(socket, messageId);
 }
 
 wss.on("connection", (socket) => {
   clients.add(socket);
 
-  socket.on("message", (raw) => {
-    const message = parseFrame(raw);
-    if (!message) return;
-    try {
-      handleMessage(socket, message);
-    } catch (error) {
-      // e.g. a CRDT_UPDATE whose payload isn't a valid Yjs update.
-      console.error(`Dropping ${message.type} message that failed to handle:`, error);
-    }
-  });
+  socket.on("message", (raw) => onFrame(socket, raw));
 
   socket.on("close", () => {
     clients.delete(socket);

@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { randomUUID } from "node:crypto";
-import { PrismaClient } from "@prisma/client";
-import { e2eEnabled, startE2eServer, Peer, type E2eServer } from "./test-support/e2e-server.js";
+import { e2eEnabled, startE2eServer, Peer, readCardRow, waitForRow, type E2eServer } from "./test-support/e2e-server.js";
 
 // Drives the real server process over a real WebSocket against a throwaway
 // Postgres database (localhost only — see test-support/e2e-server.ts). Skipped,
@@ -11,23 +10,6 @@ import { e2eEnabled, startE2eServer, Peer, type E2eServer } from "./test-support
 // no overwrite, no rebroadcast, no DB write. (Before this was fixed the
 // replay overwrote the card, was rebroadcast, and then the DB's primary-key
 // violation went unhandled and killed the whole server process.)
-
-async function readCardRow(databaseUrl: string, id: string) {
-  const db = new PrismaClient({ datasourceUrl: databaseUrl });
-  try {
-    return await db.card.findUnique({ where: { id } });
-  } finally {
-    await db.$disconnect();
-  }
-}
-
-async function waitForRow(databaseUrl: string, id: string, ready: (row: Awaited<ReturnType<typeof readCardRow>>) => boolean) {
-  const deadline = Date.now() + 5000;
-  while (!ready(await readCardRow(databaseUrl, id))) {
-    if (Date.now() > deadline) throw new Error("timed out waiting for the write to reach Postgres");
-    await new Promise((r) => setTimeout(r, 50));
-  }
-}
 
 describe.skipIf(!e2eEnabled)("duplicate CREATE for an existing id (e2e, localhost only)", () => {
   let server: E2eServer;

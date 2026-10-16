@@ -20,7 +20,7 @@ vi.mock("@prisma/client", () => {
   return { PrismaClient };
 });
 
-const { createEntity, applyMutation, flushWrites } = await import("./store.js");
+const { createEntity, applyMutation, applyDelete, flushWrites, cards } = await import("./store.js");
 
 const cardValues = () => ({
   columnId: "column-1",
@@ -97,5 +97,27 @@ describe("the DB write queue", () => {
     await new Promise((r) => setTimeout(r, 20)); // unhandledRejection fires on a later tick
 
     expect(unhandled).toEqual([]);
+  });
+});
+
+describe("DELETE is idempotent", () => {
+  test("a second delete of the same card changes nothing: false, same deletedAt, no second DB write", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const id = randomUUID();
+      createEntity("card", id, cardValues());
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      expect(applyDelete("card", id)).toBe(true);
+      await flushWrites();
+
+      vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+      expect(applyDelete("card", id)).toBe(false);
+      await flushWrites();
+
+      expect(cards.get(id)?.deletedAt).toBe("2026-01-01T00:00:00.000Z");
+      expect(db.cardUpdate).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
