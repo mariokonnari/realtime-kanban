@@ -10,6 +10,7 @@ import {
   columnDocFor,
   isKnownColumn,
   persistColumnDoc,
+  repairStoredOrders,
   flushWrites,
   getFullState,
   initStore,
@@ -43,6 +44,20 @@ assertServerDatabaseHost(databaseUrl, process.env);
 
 await initStore();
 await seedDemoBoard();
+
+// Data written before the repair existed (or by a process that crashed between a
+// move's frames) may already list a card twice. Heal it before the first client
+// can see it, and persist the result. A failure here must not keep the server down:
+// the repair is an improvement on data that was already being served, so log it and boot.
+try {
+  const healedAtStart = repairStoredOrders();
+  if (healedAtStart.length > 0) {
+    await flushWrites();
+    console.log(`Repaired the card order of ${healedAtStart.length} column(s) at startup.`);
+  }
+} catch (error) {
+  console.error("Startup card order repair failed:", error);
+}
 
 // WebSocket handshakes aren't subject to browser CORS/same-origin checks
 // the way fetch()/XHR are — with no verifyClient at all, this server
@@ -84,6 +99,22 @@ function broadcast(message: unknown, exclude?: WebSocket) {
     if (client !== exclude && client.readyState === WebSocket.OPEN) {
       client.send(payload);
     }
+  }
+}
+
+// After a CRDT_UPDATE or a columnId MUTATE has been applied: delete the order
+// entries that disagree with the cards' columnIds, and tell EVERY client —
+// the sender too, since its own optimistic insert may be one of the entries
+// deleted. These frames are sent from here, not fed back through processFrame,
+// so they never trigger another repair. A failure must not read as the sender's
+// fault (a thrown handler counts as a violation), so it is logged and dropped.
+function broadcastRepairs() {
+  try {
+    for (const { columnId, update } of repairStoredOrders()) {
+      broadcast({ type: "CRDT_UPDATE", columnId, update } satisfies ServerMessage);
+    }
+  } catch (error) {
+    console.error("Card order repair failed:", error);
   }
 }
 
@@ -138,6 +169,7 @@ function handleMessage(socket: WebSocket, message: ClientMessage) {
         // local copy live instead of waiting for a reconnect/resync.
         const updatedAt = message.entityType === "card" ? cards.get(message.entityId)?.updatedAt : undefined;
         broadcast(updatedAt ? { ...message, updatedAt } : message, socket);
+        if (message.entityType === "card" && message.field === "columnId") broadcastRepairs();
       }
       break;
     }
@@ -157,6 +189,7 @@ function handleMessage(socket: WebSocket, message: ClientMessage) {
       Y.applyUpdate(doc, decodeUpdate(message.update));
       persistColumnDoc(message.columnId);
       broadcast(message, socket); // relay the same base64 string, no re-encoding needed
+      broadcastRepairs();
       break;
     }
 

@@ -4,6 +4,7 @@ import { PrismaClient } from "@prisma/client";
 import type { Board, Column, Card, LamportClock, EntityType } from "@realtime-kanban/shared-types";
 import { encodeUpdate, isNewer, fieldKey } from "@realtime-kanban/shared-types";
 import { withBoardSeedLock } from "./board-seed-lock.js";
+import { repairColumnOrders } from "./column-order-repair.js";
 
 type Entity = Board | Column | Card;
 
@@ -210,6 +211,22 @@ export function persistColumnDoc(columnId: string): void {
       update: { state },
     }),
   );
+}
+
+/**
+ * Enforces "every live card has one entry, in the column its columnId names" over
+ * the whole board (see column-order-repair.ts), persists each doc it changed, and
+ * returns one update per changed column for the caller to broadcast. The update is
+ * the state-vector diff against the doc as it was before the repair; a repair only
+ * deletes, so that diff is the doc's delete set.
+ */
+export function repairStoredOrders(): { columnId: string; update: string }[] {
+  const before = new Map<string, Uint8Array>();
+  for (const [columnId, doc] of columnDocs) before.set(columnId, Y.encodeStateVector(doc));
+  return repairColumnOrders(columnDocs, cards.values()).map((columnId) => {
+    persistColumnDoc(columnId);
+    return { columnId, update: encodeUpdate(Y.encodeStateAsUpdate(columnDocs.get(columnId)!, before.get(columnId))) };
+  });
 }
 
 /** Full snapshot for a newly-connected client (SYNC_RESPONSE payload). */
