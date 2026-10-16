@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The major version used for local development (node -v: v24.x). Bump it here, in one place.
+  NODE_VERSION: "24"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  checks:
+    name: Typecheck and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # A throwaway database for this run. These credentials are not secrets: the
+    # container only exists for the length of the job and is not reachable from outside it.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: kanban
+          POSTGRES_PASSWORD: kanban
+          POSTGRES_DB: kanban
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kanban -d kanban"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://kanban:kanban@127.0.0.1:5432/kanban?schema=public
+      # The database-backed suites (seed-order, every *.e2e.test.*) skip themselves when there
+      # is no localhost database. Here that would be a green run that tested nothing, so with
+      # this set they fail instead. Set in this workflow only.
+      REQUIRE_DB: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      # Both apps import shared-types as compiled output (see README), so it comes first.
+      - run: npm run build:shared-types
+
+      - run: npm run prisma:generate --workspace=apps/server
+
+      - name: tsc (apps/server)
+        run: npx tsc -p apps/server --noEmit
+
+      - name: tsc (apps/web)
+        run: npx tsc -p apps/web
+
+      - name: Typecheck the test files
+        run: npm run typecheck:tests --workspace=apps/web
+
+      - name: Typecheck the browser tests
+        run: npm run typecheck --workspace=apps/e2e
+
+      - name: Apply migrations to the CI database
+        run: npm run prisma:migrate:deploy --workspace=apps/server
+
+      - name: Tests (apps/server)
+        run: npm test --workspace=apps/server
+
+      - name: Tests (apps/web)
+        run: npm test --workspace=apps/web
+
+  browser:
+    name: Browser tests (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: kanban
+          POSTGRES_PASSWORD: kanban
+          POSTGRES_DB: kanban
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kanban -d kanban"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # The tests create a kanban_e2e_* database next to this one for each test, and drop it afterwards.
+      DATABASE_URL: postgresql://kanban:kanban@127.0.0.1:5432/kanban?schema=public
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build:shared-types
+
+      - run: npm run prisma:generate --workspace=apps/server
+
+      - name: Install the browser
+        run: npx playwright install --with-deps chromium
+
+      # Builds apps/web with NEXT_PUBLIC_WS_URL pointing at the test server, serves it, and runs
+      # the tests; see apps/e2e/playwright.config.ts.
+      - name: Playwright
+        run: npm run test:e2e --workspace=apps/e2e
+
+      - name: Keep the report when something failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            apps/e2e/playwright-report
+            apps/e2e/test-results
+          if-no-files-found: ignore
+          retention-days: 7
