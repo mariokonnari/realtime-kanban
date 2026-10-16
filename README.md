@@ -86,7 +86,13 @@ start.
 
 **LWW tie-breaking:** every field mutation carries a Lamport clock
 (`{ lamport, clientId }`), not a wall-clock timestamp. Higher
-`lamport` wins; ties break on `clientId`.
+`lamport` wins; ties break on `clientId`. Every replica runs the same
+`isNewer()` (it lives in `packages/shared-types`): the server on the way
+in, and each client against its own per-field clock map when applying a
+remote write, so a stale write is ignored wherever it comes from. The
+map is seeded from `SYNC_RESPONSE.fieldClocks`, and a client advances its
+own counter past every clock it receives, so an edit made after seeing
+someone else's can't stamp a lower clock and lose to it.
 
 **Tombstones:** deletes never remove a row — they set `deletedAt`.
 Delete wins unconditionally: a concurrent edit to a tombstoned card
@@ -106,12 +112,72 @@ current state immediately instead of waiting for the next edit.
 **Offline queue:** while the socket isn't open, outbound `MUTATE`,
 `CREATE`, `DELETE`, and `CRDT_UPDATE` messages are queued durably in
 IndexedDB (`apps/web/lib/offline-queue.ts`) instead of being dropped.
-On reconnect the client sends `SYNC_REQUEST` first, then replays the
-queue in insertion order, deleting each entry after it's sent; entries
-left by a closed tab or a reload are replayed the same way.
+Each queued entry gets a `messageId` (a UUID, made once when it's
+queued and stored with it, so every replay reuses it). On reconnect the
+client sends `SYNC_REQUEST` first, then replays the queue in insertion
+order. The server answers each message that carries a `messageId` with
+`ACK {messageId}` (to the sender only), once it has handled it and its
+DB writes have settled; the client deletes the entry **when the ACK
+arrives, not when it's sent**. An entry that is sent but never ACKed
+(socket dropped, tab closed) is sent again on the next connection or
+page load, under the same `messageId`. Entries left in IndexedDB by an
+older client have no `messageId`, are never ACKed, and are still deleted
+as soon as they're sent. The same applies to a server that doesn't ACK:
+every `SYNC_RESPONSE` carries `acks: true` from a server that does, and
+a client assumes ACK support on a new socket only until that socket's
+first `SYNC_RESPONSE`. If that response lacks the flag (a server from
+before ACKs), the client counts what it already sent on that socket as
+delivered, deletes those entries, releases the drain lock, and uses
+delete-on-send for that socket; the decision is made once per socket and
+reset when it closes. If the server can never accept a message (it's
+invalid, or handling it throws) it ACKs with an `error` and the client
+drops the entry instead of replaying it forever.
 `PRESENCE` is not queued — it's ephemeral and sent fresh on connect.
 The top bar shows "Offline — N pending" (or "Syncing — N pending"
-while draining) until the queue is empty.
+while draining or waiting for ACKs) until the queue is empty.
+
+Two tabs share one IndexedDB store, so a drain holds a Web Lock until
+every entry it sent has been ACKed or its socket has closed. A lock
+(rather than an "in flight" marker in IndexedDB) is released by the
+browser the moment its tab dies, so a crashed tab can never leave an
+entry stuck as another tab's; the cost is that the second tab waits out
+the first one's ACK round trip.
+
+## Delivery and convergence: what the tests prove
+
+**Delivery: at-least-once, with idempotent handlers — for queued
+messages.** A message that goes through the queue (sent while offline, or
+while earlier entries are still queued or awaiting their ACK) is retained
+until the server ACKs it, so it is delivered at least once; because a
+replay can therefore arrive more than once, every durable handler is safe
+to run twice. This is not exactly-once. Each of these is covered by a test
+that drives the real server over a real WebSocket
+(`apps/server/src/ack.e2e.test.ts`, `create-idempotency.e2e.test.ts`):
+
+- `CREATE` for an id the server already has — live or tombstoned,
+  including after a restart — is ignored: no overwrite, no DB write, no
+  rebroadcast. A replay of a live card's `CREATE` is still ACKed.
+- `DELETE` of an already-tombstoned card is ignored: `deletedAt` isn't
+  re-stamped, nothing is written, nothing is rebroadcast.
+- `MUTATE` replayed with an identical clock is a no-op (not newer than
+  itself); a stale one is rejected. Both are ACKed.
+- `CRDT_UPDATE` replayed leaves one copy of the card in the column order.
+- A message with no `messageId` is still accepted and never ACKed; the
+  `messageId` isn't relayed to other clients.
+
+**Convergence: shown for one field, one peer, three interleavings.**
+`apps/web/lib/convergence.e2e.test.tsx` runs the real client
+(`BoardProvider` + `WsClient`) against the real server and one other
+peer, editing the same card title: (1) the other peer's edit has the
+higher clock and reaches the server first; (2) it has the lower clock and
+reaches the server first; (3) the client edits after seeing the other
+peer's edit. In all three, what the client displays equals the server's
+value. The server sends no "you lost" reply — the client's own clock
+check is what does it. Not shown: three or more clients, fields other than
+`title` end to end (`description` and `columnId` use the same code path
+but have no end-to-end test), network partitions, or CRDT card ordering
+end to end (the Yjs guarantee itself is tested at the library level in
+`concurrency.test.ts`).
 
 ## Dashboard
 
@@ -266,38 +332,73 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
 - **No auth** — anyone with the URL can edit or delete anything. The
   project is about sync strategies, so identity was left out of scope;
   a `clientId` is just a per-tab tiebreaker for LWW, not a user.
-- **Duplicate sends are possible.** If a tab closes between sending a
-  queued entry and deleting it from IndexedDB, that entry replays again
-  on next load. The server's `CREATE` isn't idempotent, so a duplicate
-  send resets that card's fields rather than being silently ignored, and
-  there's no ack protocol to prevent it.
-- **A client that loses an LWW conflict while online is never told it
-  lost.** The offline queue's post-replay sync fixes this for the
-  reconnect case only; the general case predates the queue and is out of
-  its scope, since the server drops a stale write without replying.
-- **The queue's fallback and concurrency paths are untested.** Without
-  IndexedDB access (some private-browsing modes block it entirely) the
-  queue degrades to in-memory only for that session: queued edits still
-  replay, but won't survive a reload. That path, two tabs draining the
-  queue concurrently, and a tab closing mid-drain have no automated
-  tests.
-- **Test coverage is unit-level, not end-to-end.**
-  `apps/server/src/*.test.ts` covers the LWW tie-breaking rules, the
-  CRDT-vs-naive-LWW ordering guarantee side by side, and tombstone
-  behavior; `apps/web/**/*.test.ts` covers the board reducer and
-  `CardItem`. Nothing drives the actual WebSocket server end-to-end,
-  and `Board.tsx`/`Column.tsx` and the drag-and-drop interaction
-  aren't covered.
+- **Messages sent straight through an open socket aren't ACK-tracked.**
+  The queue only holds messages sent while the socket is closed or while
+  earlier entries are still queued or awaiting an ACK. A message sent
+  directly on an idle open socket has no `messageId` and isn't kept: if
+  the connection drops before the server reads it, it's lost. So the
+  at-least-once guarantee above covers queued messages only. Closing this
+  means tracking direct sends until their ACK and moving the unACKed ones
+  into the queue when the socket closes.
+- **An ACK means "handled and its DB writes settled", not "persisted
+  successfully".** A failed write is logged with its entity and field
+  (`DB write failed (...)`) and the message is still ACKed, because
+  replaying it can't repair the write. Memory and Postgres can disagree
+  until the next restart after such a failure.
+- **Deploy order no longer matters for ACKs, but a short window
+  remains.** A client against a server that predates ACKs falls back to
+  delete-on-send as soon as its first `SYNC_RESPONSE` arrives without
+  `acks: true` (tested against a stub server that never ACKs). Queued
+  entries are sent straight after `SYNC_REQUEST`, before that response
+  comes back; if the socket closes in that window they stay queued and
+  replay on the next connection. That is harmless against a current
+  server, but a server from before idempotent `CREATE` would treat the
+  replay as a duplicate create (and, before the crash fixes, die on it).
+  An older client against a newer server is fine: it sends no
+  `messageId`, and its message switch has no case for `ACK` (or any
+  unknown type) and ignores extra `SYNC_RESPONSE` fields.
+- **No heartbeat and no ACK timeout.** A server that advertises ACKs but
+  stalls leaves the client at "Syncing — N pending" with the drain lock
+  held until its socket closes. This covers a hung database write (ACKs
+  wait for the DB write queue, so they stop for everyone — correct, since
+  nothing is lost, but nothing clears), a server bug, and a half-open
+  socket. While it lasts, every edit takes the queue path (the direct
+  path is off while any entry awaits an ACK), so the queue grows and is
+  replayed in full on reconnect or reload, and another tab can't drain.
+  The fix would be a heartbeat that closes a socket after N seconds of
+  silence, letting the normal reconnect and replay run.
+- **The server doesn't validate message shapes beyond `type`.** A
+  `MUTATE` with no `clock` is applied in memory and broadcast when the
+  field has no clock yet, and a garbage `CRDT_UPDATE` for an unknown
+  column leaves an empty doc registered in memory (and listed in every
+  `SYNC_RESPONSE`) until restart. A handler that throws is caught and
+  logged, but anything it mutated before throwing stays mutated.
+- **The queue's browser-level paths are only tested against fakes.**
+  Two-tab draining is tested against a stand-in for `navigator.locks`
+  (and `fake-indexeddb`), not a real browser; a tab closing mid-drain is
+  tested as its socket closing. Without IndexedDB (some private-browsing
+  modes block it entirely) the queue degrades to in-memory only for that
+  session: queued edits still replay, but won't survive a reload.
+- **Test coverage is mostly unit-level plus a few end-to-end suites.**
+  `apps/server/src/*.test.ts` covers the LWW rules, the CRDT-vs-naive-LWW
+  ordering guarantee, tombstones, the DB write queue, and — against a real
+  server process and Postgres (`*.e2e.test.ts`) — ACKs, idempotent
+  handlers, malformed frames, and rejected writes; `apps/web/**/*.test.ts`
+  covers the board reducer, the offline queue, `CardItem`, and the
+  convergence and ACK suites above. `Board.tsx`/`Column.tsx` and the
+  drag-and-drop interaction aren't covered.
 - **No board/column management UI** — one board, three fixed columns,
   seeded server-side. Column order is a plain field (not a CRDT) and
   the UI only ever renders the first board, so nothing needed to
   create, rename, or reorder them yet.
-- **Seed-order regression tests skip silently without local Postgres.**
-  `seed-order.test.ts` talks to a real database and only runs when
-  `DATABASE_URL` points at localhost (the same guard the seed script
-  uses, so tests can never touch a remote DB). With no local Postgres
-  running they're skipped, not failed, so a green run doesn't prove
-  they passed.
+- **Database-backed tests skip silently without local Postgres.**
+  `seed-order.test.ts` and every `*.e2e.test.*` file talk to a real
+  database and only run when `DATABASE_URL` (or `apps/server/.env`)
+  points at localhost (the same guard the seed script uses, so tests can
+  never touch a remote DB). The e2e suites never touch your dev data:
+  each server they start gets its own throwaway `kanban_e2e_*` database,
+  dropped afterwards. With no local Postgres running they're skipped, not
+  failed, so a green run doesn't prove they passed.
 - **A process that loses the board-seeding race can serve an empty
   board.** The advisory lock in `board-seed-lock.ts` guarantees exactly
   one board is created even when several server instances start at
