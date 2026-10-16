@@ -3,6 +3,7 @@ import { PrismaClient } from "@prisma/client";
 import { getDatabaseHostname, isLocalHostname } from "./db-guard.js";
 import { seedDemoBoard } from "./store.js";
 import { ensureBoardAndColumns, seedCards } from "./scripts/seed-demo.js";
+import { requireDb, requireDbMessage } from "./test-support/require-db.js";
 
 // These are real Postgres integration tests, not the mocked-Prisma unit
 // tests store.test.ts uses — the whole point is proving board seeding is
@@ -12,6 +13,15 @@ import { ensureBoardAndColumns, seedCards } from "./scripts/seed-demo.js";
 const databaseUrl = process.env.DATABASE_URL ?? "";
 const hostname = databaseUrl ? getDatabaseHostname(databaseUrl) : "";
 const runIntegration = isLocalHostname(hostname);
+
+// In CI (REQUIRE_DB=1) a missing localhost database must fail the run, not skip it. This is a
+// separate test rather than letting the suite below run: its hooks wipe the boards table, and
+// they must never run against a database that is not localhost.
+if (requireDb && !runIntegration) {
+  test("REQUIRE_DB=1: DATABASE_URL must point at a localhost database", () => {
+    throw new Error(requireDbMessage);
+  });
+}
 
 describe.skipIf(!runIntegration)("board seeding is order-independent (integration, localhost only)", () => {
   const prisma = new PrismaClient();

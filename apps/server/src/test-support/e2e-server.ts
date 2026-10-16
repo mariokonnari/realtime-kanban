@@ -9,6 +9,7 @@ import { PrismaClient } from "@prisma/client";
 import WebSocket from "ws";
 import type { ClientMessage, ServerMessage, SyncResponseMessage } from "@realtime-kanban/shared-types";
 import { getDatabaseHostname, isLocalHostname } from "../db-guard.js";
+import { requireDb, requireDbMessage } from "./require-db.js";
 
 // Test support for driving the *real* server process (src/index.ts) over a
 // real WebSocket against a real Postgres. Localhost only, and never the dev
@@ -30,10 +31,18 @@ function baseDatabaseUrl(): string | undefined {
 
 const baseUrl = baseDatabaseUrl();
 
-/** True only when DATABASE_URL (or apps/server/.env) points at localhost — same rule as seed-order.test.ts. */
-export const e2eEnabled = baseUrl !== undefined && isLocalHostname(getDatabaseHostname(baseUrl));
+const baseUrlIsLocal = baseUrl !== undefined && isLocalHostname(getDatabaseHostname(baseUrl));
+
+/**
+ * True when DATABASE_URL (or apps/server/.env) points at localhost — same rule as seed-order.test.ts.
+ * With REQUIRE_DB=1 it is true regardless, so the suites run instead of skipping and fail in
+ * createDatabase() (which still refuses anything that is not localhost) when there is no database.
+ */
+export const e2eEnabled = baseUrlIsLocal || requireDb;
 
 async function createDatabase(): Promise<{ name: string; url: string }> {
+  // The localhost rule holds even when REQUIRE_DB forced the suites on: nothing below runs against a remote database.
+  if (!baseUrlIsLocal) throw new Error(requireDbMessage);
   const name = `kanban_e2e_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
   const admin = new PrismaClient({ datasourceUrl: baseUrl });
   try {
