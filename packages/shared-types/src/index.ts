@@ -1,5 +1,6 @@
 export * from "./binary.js";
 export * from "./lww.js";
+export * from "./schema.js";
 
 // ---- Conflict resolution primitives ----
 
