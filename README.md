@@ -70,12 +70,12 @@ same as they'd import any other real npm package.
 
 ## Sync strategy per field
 
-| Field | Strategy |
-|---|---|
-| `Board.name`, `Column.title` | LWW |
-| `Card.title`, `Card.description`, `Card.columnId` | LWW |
-| `Card.position` (ordering) | Yjs `Y.Array`, one per column |
-| `Column.order` | Fixed at seed time — no reordering UI yet |
+| Field                                             | Strategy                                  |
+| ------------------------------------------------- | ----------------------------------------- |
+| `Board.name`, `Column.title`                      | LWW                                       |
+| `Card.title`, `Card.description`, `Card.columnId` | LWW                                       |
+| `Card.position` (ordering)                        | Yjs `Y.Array`, one per column             |
+| `Column.order`                                    | Fixed at seed time — no reordering UI yet |
 
 **Why `Card.position` gets CRDT treatment and `Column.order`
 doesn't:** card drags are the highest-frequency interaction and the
@@ -175,9 +175,10 @@ peer's edit. In all three, what the client displays equals the server's
 value. The server sends no "you lost" reply — the client's own clock
 check is what does it. Not shown: three or more clients, fields other than
 `title` end to end (`description` and `columnId` use the same code path
-but have no end-to-end test), network partitions, or CRDT card ordering
-end to end (the Yjs guarantee itself is tested at the library level in
-`concurrency.test.ts`).
+but have no end-to-end test, apart from `columnId` in the concurrent-move
+tests below), network partitions, or CRDT card ordering end to end beyond
+two browsers moving one card at once (the Yjs guarantee itself is tested at
+the library level in `concurrency.test.ts`).
 
 ## Property and browser tests
 
@@ -191,7 +192,7 @@ hand-picked ones.
   `FieldClocks`) in random orders with duplicates. All end identical, and
   identical to the highest-clock write per field — checked against a
   comparator written separately from `isNewer`, because agreement alone is
-  satisfied by a consistently *wrong* rule (flipping `isNewer` to prefer the
+  satisfied by a consistently _wrong_ rule (flipping `isNewer` to prefer the
   lower clock keeps every replica in agreement; only the winner check
   fails). The DB stub shows the server's queued writes end on the same
   winner. Not covered: the network, real persistence, tombstones (the
@@ -205,6 +206,16 @@ hand-picked ones.
   joiner. All converge, no card is lost, and when each card is moved by one
   replica only every card appears exactly once. Not covered: the network,
   Postgres, tombstones, and whether the resulting order is what a user meant.
+  Its last describe runs the server's order repair (see "Known gaps") over
+  random concurrent moves of the same seed cards by 2–3 replicas in three
+  columns: each move is the MUTATE of `columnId` plus the two inserts and
+  deletes `moveCard` sends, the server applies them merged in any order and
+  repairs once, or as the real server does (per-sender order, replays, a repair
+  after every frame), and every card ends up exactly once in the column the
+  highest clock names, replicas and a late joiner converge on that, and the
+  repair only deletes. Not covered there: creates, deletes, ties in the
+  columns a card is dropped between, a MUTATE arriving after its inserts, and
+  anything but the repair function (the wiring is in `order-repair.e2e.test.ts`).
 
 **Browser tests** (`apps/e2e`, Playwright, Chromium) run against localhost
 only: the web app is built with `NEXT_PUBLIC_WS_URL` pointing at the test
@@ -231,6 +242,18 @@ that already has a listener. (The build itself fetches the Google fonts
   Without `navigator.locks` every entry goes out twice, so the count is
   not vacuous. Not covered: a tab dying or the server dying mid-drain, more
   than two pages, queued deletes, reloads.
+- `concurrent-move.spec.ts` — two contexts drag one shared card (native
+  drag and drop) while each page's incoming `CRDT_UPDATE` and `MUTATE` frames
+  are held, so the moves are concurrent by construction, then release them.
+  Three cases: both reorder it within one column to different places; each
+  moves it to a different other column; one moves it while the other reorders
+  it in its own column. Each asserts that the card is on screen exactly once,
+  on both pages, in the column Postgres's `columnId` names (for the
+  two-column case whichever of the two it names, which varies between runs),
+  once in the order arrays, and that a reload changes nothing. The repair's
+  frame is held with the rest, so the assertions run after the duplicate is
+  gone; the test does not show how long it is visible. Two browsers, one card,
+  A's frames always reach the server first.
 
 ## CI
 
@@ -279,25 +302,25 @@ error)`): with a `messageId` it is ACKed with `error: "invalid message: …"` an
 the client drops the entry; without one it is only logged. There is no second
 mechanism.
 
-| Limit | Value | Why |
-|---|---|---|
-| `messageId`, entity/column/client ids | 128 chars | clients send 36-char UUIDs |
-| field name | 64 chars | `title`, `description`, `columnId` |
-| any text value (title, description, timestamps) | 10 000 chars | |
-| presence name / colour | 64 / 32 chars | |
-| `CRDT_UPDATE` base64 | 512 KiB (≈384 KiB of Yjs update) | a diff of one reorder is tens of bytes; this leaves room for a column with thousands of cards |
-| `maxPayload` (ws) | 1 MiB | the largest legal frame is the 512 KiB update plus a small envelope; ws refuses anything bigger before buffering it |
+| Limit                                           | Value                            | Why                                                                                                                 |
+| ----------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `messageId`, entity/column/client ids           | 128 chars                        | clients send 36-char UUIDs                                                                                          |
+| field name                                      | 64 chars                         | `title`, `description`, `columnId`                                                                                  |
+| any text value (title, description, timestamps) | 10 000 chars                     |                                                                                                                     |
+| presence name / colour                          | 64 / 32 chars                    |                                                                                                                     |
+| `CRDT_UPDATE` base64                            | 512 KiB (≈384 KiB of Yjs update) | a diff of one reorder is tens of bytes; this leaves room for a column with thousands of cards                       |
+| `maxPayload` (ws)                               | 1 MiB                            | the largest legal frame is the 512 KiB update plus a small envelope; ws refuses anything bigger before buffering it |
 
 **Rate limit: a token bucket per connection that delays, never drops.** The
 client's reconnect (`ws-client.ts`, `flush()`) sends `SYNC_REQUEST`, then its
 whole outbox in one unpaced burst, so the bucket is sized for that burst, not
 for steady typing:
 
-| | Value | Why |
-|---|---|---|
-| burst (bucket size) | 1000 frames | creating a card queues 2 messages (`CREATE` + `CRDT_UPDATE`), moving one up to 3, an edit 1: an offline session of ~330 cards or moves replays inside the burst without a single delay. A 500-message replay uses half of it |
-| refill | 100 frames/s | live use is a few frames a second (a drag sends at most 3 frames, once, on drop), so this is well above anything a person produces and only matters once the burst is spent |
-| backlog | 2000 frames and 4 MiB | burst + backlog = 3000 frames absorbed per connection; the tail of that is delayed at most 20 s |
+|                     | Value                 | Why                                                                                                                                                                                                                          |
+| ------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| burst (bucket size) | 1000 frames           | creating a card queues 2 messages (`CREATE` + `CRDT_UPDATE`), moving one up to 3, an edit 1: an offline session of ~330 cards or moves replays inside the burst without a single delay. A 500-message replay uses half of it |
+| refill              | 100 frames/s          | live use is a few frames a second (a drag sends at most 3 frames, once, on drop), so this is well above anything a person produces and only matters once the burst is spent                                                  |
+| backlog             | 2000 frames and 4 MiB | burst + backlog = 3000 frames absorbed per connection; the tail of that is delayed at most 20 s                                                                                                                              |
 
 While a connection has anything queued, every later frame queues behind it,
 so processing order per socket never changes. That is a protocol property:
@@ -353,6 +376,8 @@ conflict-resolution code itself never touches Prisma directly.
   already-superseded clock could finish after a newer one and leave
   the DB holding the stale value.
 - `seedDemoBoard()` only seeds if `boards` is empty in Postgres.
+- After loading and seeding, and before listening, the server runs the card
+  order repair once and persists any column it changed (see "Known gaps").
 
 See "Running this locally" above for the local Postgres setup.
 
@@ -456,7 +481,7 @@ from Root Directory).
 
 ### WebSocket origin checks (CORS)
 
-No server changes were needed for the deployed web app to *connect* —
+No server changes were needed for the deployed web app to _connect_ —
 a WebSocket handshake isn't a `fetch()`/XHR request, so it isn't
 subject to the browser's CORS/same-origin checks. `apps/server` will
 accept a connection from your Vercel domain with zero configuration,
@@ -518,14 +543,63 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
   in Chromium it leaves an already-open WebSocket open (the top bar still
   said "live" after 6 s), drops what is sent on it and never delivers what
   the server sends, so the offline queue is never exercised.
-- **Two clients moving the same card at the same time leave it twice.**
-  `moveCard()` is a delete followed by an insert, not a Yjs move. Both
-  clients delete the one old entry and each inserts its own, so every
-  replica converges to a column (or two) listing the card twice, and
-  `ColumnView` maps each entry to a row (read from the code, not tried in
-  a browser). Found by
-  `yjs-ordering.property.test.ts`, which pins the behaviour down in its
-  last test; not fixed.
+- **Two clients moving the same card at the same time list it twice, briefly;
+  the server then repairs it, within limits.** `moveCard()` is still a delete
+  followed by an insert, not a Yjs move, so two concurrent moves each insert
+  their own entry and the merged order arrays list the card twice (in one
+  column, or in two), and `ColumnView` draws a row per entry. The server now
+  enforces one invariant (`apps/server/src/column-order-repair.ts`): for every
+  non-tombstoned card whose `columnId` column lists it at least once, that
+  column holds exactly one entry, the first, and every other entry for the card
+  (same column or another) is deleted. It runs after every applied
+  `CRDT_UPDATE` and every applied `MUTATE` of `columnId`, and once at startup
+  before the server listens (so data corrupted by the old behaviour heals on
+  deploy). A failed startup repair is logged and the server boots anyway: a card
+  listed twice is a visible flaw, an unreachable server is an outage. The
+  invariant is therefore enforced only when the repair ran.
+  Each changed column is persisted and its deletions are broadcast to
+  **every** client, the sender included, as a `CRDT_UPDATE` without a
+  `messageId`; those frames are sent from the repair, not fed back through the
+  frame handler, so they trigger nothing. Until that frame reaches a page, the
+  page shows the card twice: the relay of a move goes out before the repair
+  frame, so the window exists by construction (its length is not measured).
+  - **What survives.** The column is the one `columnId` names, so it is the LWW
+    winner of the two moves and can be either mover's; the other mover's card
+    jumps back. The position is the first entry in that column of the merged
+    array: in the tested cases one of the two moves' drop points (the browser
+    test checks the same-column case: top or end, never the middle), and the
+    other mover's drop point is discarded.
+  - **What it does not do.** It only deletes. A card with no entry in its
+    `columnId` column is left exactly as it is, so a card whose `columnId`
+    `MUTATE` was applied but whose inserts never arrived (the connection
+    dropped mid-move; direct sends are not ACK-tracked) stays where it was, or
+    in no column if its delete arrived but its insert did not, as before. So
+    "exactly one entry in the column `columnId` names" holds for cards that
+    have an entry there, not for every card. It trusts `columnId`: it relies on
+    a move's `MUTATE` reaching the server before that move's `CRDT_UPDATE`s,
+    which the client's send order and the in-order handling of one socket give
+    but nothing on the server checks; with a stale `columnId` it would keep the
+    old entry and delete the new one (`column-order-repair.test.ts` pins this).
+    Tombstoned cards are skipped, so their entries stay in the arrays as
+    before. Not tested: three or more browsers, a delete or edit racing a move,
+    or the arrival order reversed.
+  - **Cost.** Each pass scans every column's array: O(entries on the board),
+    once per `CRDT_UPDATE` and per `columnId` `MUTATE`, on the one thread that
+    serves every socket. Measured with nothing to repair, on one development
+    machine: about 0.07 ms at 300 cards, 0.7 ms at 3 000, 13 ms at 30 000. The
+    scan is not narrowed to the cards a message touched: finding a card's other
+    entries means reading every array anyway. A repair frame is a state-vector
+    diff, which for a deletion-only change carries the column's whole delete
+    set, not just the new deletions: about 3 bytes per scattered earlier
+    deletion (15 KB after 5 000 of them), and sent only when something was
+    repaired.
+    Covered by `column-order-repair.test.ts` and `order-repair-store.test.ts`
+    (rules, idempotence, never deleting a card's only entry, tombstones),
+    `order-repair.e2e.test.ts` (the real server: who is told, no feedback loop,
+    startup heal, persistence), the last describe of
+    `yjs-ordering.property.test.ts` (random concurrent moves of the same cards
+    in three columns, repaired as the server does), and
+    `apps/e2e/tests/concurrent-move.spec.ts` (two browsers, three races).
 - **Validation checks shapes and sizes, not meaning.** See "Input
   validation and limits". Still open: a `CREATE` for a card in a column
   that doesn't exist is accepted in memory (and its DB write then fails the
@@ -553,8 +627,8 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
   that every message the real client builds passes the server's schema with
   nothing stripped; `apps/web/**/*.test.ts`
   covers the board reducer, the offline queue, `CardItem`, and the
-  convergence and ACK suites above. `Board.tsx`/`Column.tsx` and the
-  drag-and-drop interaction aren't covered.
+  convergence and ACK suites above. `Board.tsx`/`Column.tsx` have no unit
+  tests; drag and drop is exercised only by `concurrent-move.spec.ts`.
 - **No board/column management UI** — one board, three fixed columns,
   seeded server-side. Column order is a plain field (not a CRDT) and
   the UI only ever renders the first board, so nothing needed to
