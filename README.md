@@ -179,6 +179,86 @@ but have no end-to-end test), network partitions, or CRDT card ordering
 end to end (the Yjs guarantee itself is tested at the library level in
 `concurrency.test.ts`).
 
+## Input validation and limits
+
+Every frame the server reads goes through four steps, in this order, before
+any handler runs (`apps/server/src/index.ts`, `processFrame`):
+
+1. **Rate limit** (below) — a frame is handled at once or delayed in order.
+2. **Schema** — one Zod schema per `ClientMessage` type in
+   `packages/shared-types/src/schema.ts` (`parseClientMessage`), shared so
+   client tests can run the same check. Required fields are strict.
+   **Unknown extra fields are stripped, not rejected**, so an older cached
+   client, or a newer one, isn't locked out; the stripped copy is what gets
+   handled and relayed. `entityType` must be `board`/`column`/`card`; `MUTATE`
+   and `CREATE` require a `clock` (a `DELETE`'s clock is never read, so it
+   stays optional, but must be well-formed if present); a `field` must be a
+   plain identifier (it becomes a property name); a `MUTATE` value is a
+   string, number, boolean or null; `CREATE`'s `initialValues` are checked per
+   entity type and keys that aren't columns of it (including `id`) are
+   dropped.
+3. **Server state** — a `CRDT_UPDATE` must name a column the server knows
+   (`isKnownColumn`, which registers nothing) and carry something
+   `Y.decodeUpdate` can parse (it reads the structs without applying them).
+   `getColumnDoc()` is now private to `store.ts`; `columnDocFor()` only
+   creates a doc for a column that exists, so a garbage update for an unknown
+   column can no longer leave an empty doc registered and listed in every
+   `SYNC_RESPONSE`.
+4. **Handler** — runs only on a message that passed 2 and 3, so it never
+   mutates anything on behalf of one that is then refused.
+
+A refused message takes the existing error-ACK path (`reject()` → `ack(…,
+error)`): with a `messageId` it is ACKed with `error: "invalid message: …"` and
+the client drops the entry; without one it is only logged. There is no second
+mechanism.
+
+| Limit | Value | Why |
+|---|---|---|
+| `messageId`, entity/column/client ids | 128 chars | clients send 36-char UUIDs |
+| field name | 64 chars | `title`, `description`, `columnId` |
+| any text value (title, description, timestamps) | 10 000 chars | |
+| presence name / colour | 64 / 32 chars | |
+| `CRDT_UPDATE` base64 | 512 KiB (≈384 KiB of Yjs update) | a diff of one reorder is tens of bytes; this leaves room for a column with thousands of cards |
+| `maxPayload` (ws) | 1 MiB | the largest legal frame is the 512 KiB update plus a small envelope; ws refuses anything bigger before buffering it |
+
+**Rate limit: a token bucket per connection that delays, never drops.** The
+client's reconnect (`ws-client.ts`, `flush()`) sends `SYNC_REQUEST`, then its
+whole outbox in one unpaced burst, so the bucket is sized for that burst, not
+for steady typing:
+
+| | Value | Why |
+|---|---|---|
+| burst (bucket size) | 1000 frames | creating a card queues 2 messages (`CREATE` + `CRDT_UPDATE`), moving one up to 3, an edit 1: an offline session of ~330 cards or moves replays inside the burst without a single delay. A 500-message replay uses half of it |
+| refill | 100 frames/s | live use is a few frames a second (a drag sends at most 3 frames, once, on drop), so this is well above anything a person produces and only matters once the burst is spent |
+| backlog | 2000 frames and 4 MiB | burst + backlog = 3000 frames absorbed per connection; the tail of that is delayed at most 20 s |
+
+While a connection has anything queued, every later frame queues behind it,
+so processing order per socket never changes. That is a protocol property:
+the client's fallback for servers without ACKs relies on the `SYNC_RESPONSE`
+being sent before any ACK on the same socket, which holds because the
+`SYNC_REQUEST` is handled before the messages behind it. Past the backlog cap
+the socket is closed (1013) and whatever was not ACKed replays on reconnect;
+each new connection starts with a full bucket, so a replay larger than burst +
+backlog still makes progress of at least a burst per reconnect. All of these
+can be overridden with `WS_MAX_PAYLOAD`, `WS_RATE_BURST`, `WS_RATE_PER_SEC`,
+`WS_MAX_BACKLOG`, `WS_MAX_BACKLOG_BYTES`, `WS_MAX_VIOLATIONS` and
+`WS_VIOLATION_WINDOW_MS` (positive numbers; anything else is ignored).
+
+**Violations.** A frame that isn't JSON, fails the schema or the state check,
+or throws in its handler is logged (`[violation] conn=… <address> <type>:
+<reason> (n/10)` — the reason names a field, never the payload) and counts
+against its connection. 10 within 60 s close it (1008). The close happens
+after the error ACKs already queued, so the client has been told to drop those
+entries before the socket goes; otherwise they would replay, be rejected again
+and close the next connection too. A message already ACKed with an error that
+reaches the server again on a different connection (the ACK was lost with the
+first one) is answered with the error ACK again but **not counted**, once per
+`messageId` — the client has no way to know to stop, and a bounded memory
+(10 000 ids) keeps that from being a free pass: the same id repeated on one
+connection, or a third time, counts. A socket-level error (an oversized frame,
+a protocol error) is logged and handled; without a listener ws's `'error'`
+event ends the process.
+
 ## Dashboard
 
 **"Recently active"** ranks cards by `Card.updatedAt`, which is bumped
@@ -367,12 +447,15 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
   replayed in full on reconnect or reload, and another tab can't drain.
   The fix would be a heartbeat that closes a socket after N seconds of
   silence, letting the normal reconnect and replay run.
-- **The server doesn't validate message shapes beyond `type`.** A
-  `MUTATE` with no `clock` is applied in memory and broadcast when the
-  field has no clock yet, and a garbage `CRDT_UPDATE` for an unknown
-  column leaves an empty doc registered in memory (and listed in every
-  `SYNC_RESPONSE`) until restart. A handler that throws is caught and
-  logged, but anything it mutated before throwing stays mutated.
+- **Validation checks shapes and sizes, not meaning.** See "Input
+  validation and limits". Still open: a `CREATE` for a card in a column
+  that doesn't exist is accepted in memory (and its DB write then fails the
+  foreign key); a `MUTATE` can set any field name that is a plain
+  identifier, `id` included; a `lamport` as large as `Number.MAX_SAFE_INTEGER`
+  is accepted and then wins every later edit to that field; nothing bounds
+  how many entities a client may create. The limiter is per connection, so
+  reconnecting resets it — there is no per-IP limit. A `SYNC_REQUEST` costs
+  one token like any frame although it serialises the whole board.
 - **The queue's browser-level paths are only tested against fakes.**
   Two-tab draining is tested against a stand-in for `navigator.locks`
   (and `fake-indexeddb`), not a real browser; a tab closing mid-drain is
@@ -383,7 +466,11 @@ production domain unless you keep `ALLOWED_ORIGINS` updated.)
   `apps/server/src/*.test.ts` covers the LWW rules, the CRDT-vs-naive-LWW
   ordering guarantee, tombstones, the DB write queue, and — against a real
   server process and Postgres (`*.e2e.test.ts`) — ACKs, idempotent
-  handlers, malformed frames, and rejected writes; `apps/web/**/*.test.ts`
+  handlers, malformed frames, rejected writes, input validation, and the
+  rate limiter and violation handling (the latter run with small `WS_*`
+  limits so they can be reached); `apps/web/lib/wire-schema.test.tsx` checks
+  that every message the real client builds passes the server's schema with
+  nothing stripped; `apps/web/**/*.test.ts`
   covers the board reducer, the offline queue, `CardItem`, and the
   convergence and ACK suites above. `Board.tsx`/`Column.tsx` and the
   drag-and-drop interaction aren't covered.
